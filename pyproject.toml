@@ -62,6 +62,7 @@ django-q2 = "^1.7.4"
 defusedxml = "^0.7.1"
 bleach = "^6.2.0"
 bcrypt = "4.0.1" # Pinned to avoid warnings with mitmproxy 12
+bullmq = ">=2.0.0"
 
 [build-system]
 requires = ["poetry-core"]
