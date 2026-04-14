@@ -54,6 +54,7 @@ from mobsf.StaticAnalyzer.views.windows import windows
 from mobsf.StaticAnalyzer.views.android import static_analyzer as android_sa
 from mobsf.StaticAnalyzer.views.ios import static_analyzer as ios_sa
 from mobsf.StaticAnalyzer.views.ios.views import view_source as io_view_source
+from mobsf.queue_integration.views import api as queue_api
 
 from . import settings
 
@@ -87,7 +88,8 @@ urlpatterns = [
     re_path(r'^sso/acs/$',
             saml2.saml_acs,
             name='saml_acs'),
-    # REST API
+    # Queue integration — Swagger UI at /queue/docs (outside /api/ auth middleware)
+    re_path(r'^queue/', queue_api.urls),
     # Static Analysis
     re_path(r'^api/v1/upload$', api_sz.api_upload),
     re_path(r'^api/v1/scan$', api_sz.api_scan),

@@ -150,6 +150,17 @@ APKPLZ = 'https://apkplz.net/download-app/'
 
 # Database
 # https://docs.djangoproject.com/en/dev/ref/settings/#databases
+
+# Try to import AWS IAM auth utilities
+try:
+    from mobsf.queue_integration.aws_auth import (
+        get_rds_auth_token,
+        should_use_iam_auth,
+    )
+    AWS_AUTH_AVAILABLE = True
+except ImportError:
+    AWS_AUTH_AVAILABLE = False
+
 if (os.environ.get('POSTGRES_USER')
         and (os.environ.get('POSTGRES_PASSWORD')
              or os.environ.get('POSTGRES_PASSWORD_FILE'))
@@ -159,10 +170,24 @@ if (os.environ.get('POSTGRES_USER')
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
         'NAME': os.getenv('POSTGRES_DB', 'mobsf'),
         'USER': os.environ['POSTGRES_USER'],
-        'PASSWORD': get_secret_from_file_or_env('POSTGRES_PASSWORD'),
         'HOST': os.environ['POSTGRES_HOST'],
         'PORT': int(os.getenv('POSTGRES_PORT', 5432)),
     }
+
+    # Determine auth method based on NODE_ENV
+    if AWS_AUTH_AVAILABLE and should_use_iam_auth():
+        # Production: use IAM authentication
+        default['PASSWORD'] = get_rds_auth_token()
+        default['OPTIONS'] = {
+            'sslmode': 'require',  # RDS IAM auth requires SSL
+        }
+        # Shorter connection lifetime (10 min) to refresh token before expiration (15 min)
+        default['CONN_MAX_AGE'] = 600
+    else:
+        # Local development: use password from env
+        default['PASSWORD'] = get_secret_from_file_or_env('POSTGRES_PASSWORD')
+        # Standard connection pooling
+        default['CONN_MAX_AGE'] = 0  # Close connections at end of request
 else:
     # Sqlite3 support
     default = {

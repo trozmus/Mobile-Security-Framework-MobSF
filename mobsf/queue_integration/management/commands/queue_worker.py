@@ -32,6 +32,20 @@ from django.core.management.base import BaseCommand
 
 from bullmq import Queue, Worker
 
+from mobsf.queue_integration.aws_auth import (
+    get_memorydb_auth_token,
+    should_use_iam_auth,
+)
+
+try:
+    from redis.exceptions import AuthenticationError, ConnectionError as RedisConnectionError
+except ImportError:
+    # Fallback for older redis-py versions
+    class AuthenticationError(Exception):
+        pass
+    class RedisConnectionError(Exception):
+        pass
+
 from mobsf.MobSF.views.scanning import add_to_recent_scan, handle_uploaded_file
 from mobsf.StaticAnalyzer.models import StaticAnalyzerAndroid
 from mobsf.StaticAnalyzer.views.android.apk import (
@@ -53,18 +67,40 @@ def _get_output_queue() -> str:
     return os.getenv('QUEUE_OUTPUT', 'APP-SCANN-RESULT')
 
 
+def _get_errors_queue() -> str:
+    return os.getenv('QUEUE_ERRORS', 'APP-SCANN-ERRORS')
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _redis_opts() -> dict:
-    """Build connection options for BullMQ from environment variables."""
-    return {
+    """Build connection options for BullMQ from environment variables.
+
+    Auth mode is determined by NODE_ENV:
+    - local: use VALKEY_PASSWORD (username/password auth)
+    - dev, prod: use IAM authentication (requires boto3 and AWS credentials)
+    """
+    opts = {
         'host': os.getenv('VALKEY_HOST', 'localhost'),
         'port': int(os.getenv('VALKEY_PORT', '6379')),
-        'password': os.getenv('VALKEY_PASSWORD', ''),
         'username': os.getenv('VALKEY_USERNAME', 'default'),
     }
+
+    if should_use_iam_auth():
+        # Production environments: use IAM authentication
+        node_env = os.getenv('NODE_ENV', 'local')
+        logger.info('Using IAM authentication for MemoryDB (NODE_ENV=%s)', node_env)
+        opts['password'] = get_memorydb_auth_token()
+        opts['ssl'] = True
+        opts['ssl_cert_reqs'] = 'none'  # AWS MemoryDB uses self-signed certificates
+    else:
+        # Local development: use username/password
+        logger.info('Using password authentication for Redis/Valkey')
+        opts['password'] = os.getenv('VALKEY_PASSWORD', '')
+
+    return opts
 
 
 def _filename_from_url(url: str) -> str:
@@ -144,16 +180,50 @@ def _run_static_scan(filename: str, apk_bytes: bytes) -> tuple[str, dict]:
     return checksum, report
 
 
-async def _publish(payload: dict) -> None:
-    """Publish *payload* to the output queue."""
-    output_queue_name = _get_output_queue()
-    result_queue = Queue(output_queue_name, {'connection': _redis_opts()})
-    try:
-        await result_queue.add('scan-result', payload)
-        logger.info('Published to queue "%s": processID=%s status=%s',
-                    output_queue_name, payload.get('processID'), payload.get('status'))
-    finally:
-        await result_queue.close()
+async def _publish(payload: dict, max_retries: int = 2) -> None:
+    """Publish *payload* to the output or errors queue depending on status.
+
+    Automatically retries on authentication errors (expired IAM token).
+
+    Args:
+        payload: Job result payload to publish
+        max_retries: Maximum retry attempts on auth errors (default: 2)
+    """
+    is_error = payload.get('status') == 'error'
+    if is_error:
+        queue_name = _get_errors_queue()
+        job_name = 'app-binary-scan-error'
+    else:
+        queue_name = _get_output_queue()
+        job_name = 'app-binary-scan-result'
+
+    last_error = None
+    for attempt in range(max_retries):
+        q = Queue(queue_name, {'connection': _redis_opts()})
+        try:
+            await q.add(job_name, payload)
+            logger.info('Published to queue "%s" as "%s": processID=%s',
+                        queue_name, job_name, payload.get('processID'))
+            return  # Success
+        except (AuthenticationError, RedisConnectionError) as e:
+            last_error = e
+            logger.warning(
+                'Auth/connection error publishing to %s (attempt %d/%d): %s',
+                queue_name, attempt + 1, max_retries, e
+            )
+            if attempt < max_retries - 1:
+                logger.info('Refreshing credentials and retrying...')
+                await asyncio.sleep(1)
+        except Exception as e:
+            logger.error('Failed to publish to queue %s: %s', queue_name, e)
+            raise
+        finally:
+            await q.close()
+
+    # All retries exhausted
+    logger.error('Failed to publish after %d attempts. Last error: %s',
+                 max_retries, last_error)
+    raise last_error
 
 
 # ---------------------------------------------------------------------------
@@ -175,14 +245,33 @@ async def _process_job(job, token):
         On scan error:
             { processID, status: "error", error: "scan_failed", message, fileName }
     """
-    process_id = job.data.get('processID')
-    url = job.data.get('url')
+    if job.name != 'app-binary-scan-requested':
+        logger.warning('Job %s has unexpected name %r — skipping', job.id, job.name)
+        return
+
+    logger.info('Job %s raw data: %r', job.id, job.data)
+
+    job_data = job.data.get('jobData', job.data)
+
+    # Reject result payloads that were accidentally re-queued to the input queue
+    if 'report' in job_data or 'status' in job_data:
+        logger.warning(
+            'Job %s looks like a result payload (has "report"/"status" fields) — '
+            'skipping. Check that %r consumers are not re-publishing to %r.',
+            job.id, _get_output_queue(), _get_input_queue(),
+        )
+        return
+
+    process_id = job_data.get('processID')
+    url = job_data.get('url')
 
     if not process_id or not url:
-        msg = (f'Job {job.id} is missing required fields: '
-               f'processID={process_id!r}, url={url!r}')
-        logger.error(msg)
-        raise ValueError(msg)
+        logger.error(
+            'Job %s is missing required fields: processID=%r, url=%r — '
+            'skipping (expected input format: {jobData: {processID, url}})',
+            job.id, process_id, url,
+        )
+        return
 
     logger.info('Received job %s | processID=%s | url=%s', job.id, process_id, url)
 
@@ -233,7 +322,11 @@ async def _process_job(job, token):
 # ---------------------------------------------------------------------------
 
 async def _run_worker():
-    """Start the BullMQ worker and block until interrupted."""
+    """Start the BullMQ worker and block until interrupted or auth error.
+
+    Returns:
+        True if worker should restart (auth error), False if intentional stop
+    """
     opts = _redis_opts()
     input_queue_name = _get_input_queue()
     logger.info(
@@ -244,16 +337,39 @@ async def _run_worker():
         'Input queue: "%s" → Output queue: "%s"',
         input_queue_name, _get_output_queue(),
     )
-    worker = Worker(input_queue_name, _process_job, {'connection': opts})
-    logger.info('Worker listening. Press Ctrl+C to stop.')
+
+    worker = None
     try:
+        worker = Worker(input_queue_name, _process_job, {'connection': opts})
+        logger.info('Worker listening. Press Ctrl+C to stop.')
         while True:
             await asyncio.sleep(1)
+    except (AuthenticationError, RedisConnectionError) as e:
+        logger.warning('Connection/auth error in worker: %s', e)
+        logger.info('Token may have expired, will restart worker with fresh credentials')
+        return True  # Signal restart needed
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info('Shutting down worker…')
+        return False  # Intentional stop
     finally:
-        await worker.close()
-        logger.info('Worker stopped.')
+        if worker:
+            await worker.close()
+            logger.info('Worker stopped.')
+
+
+async def _run_worker_with_retry():
+    """Run worker with automatic restart on auth errors (expired IAM token)."""
+    while True:
+        try:
+            should_restart = await _run_worker()
+            if not should_restart:
+                break  # Intentional stop (Ctrl+C)
+            logger.info('Restarting worker in 2 seconds...')
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.exception('Unexpected error in worker: %s', e)
+            logger.info('Restarting worker in 5 seconds...')
+            await asyncio.sleep(5)
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +387,13 @@ class Command(BaseCommand):
             f'Starting BullMQ queue worker '
             f'[{_get_input_queue()} → {_get_output_queue()}]…'
         ))
+        node_env = os.getenv('NODE_ENV', 'local')
+        if node_env in ('dev', 'prod'):
+            self.stdout.write(self.style.NOTICE(
+                f'Using IAM authentication (NODE_ENV={node_env}) — '
+                f'worker will auto-restart on token expiration'
+            ))
         try:
-            asyncio.run(_run_worker())
+            asyncio.run(_run_worker_with_retry())
         except KeyboardInterrupt:
             self.stdout.write(self.style.WARNING('Worker interrupted by user.'))

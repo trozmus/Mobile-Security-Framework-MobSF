@@ -1,0 +1,32 @@
+services:
+
+  mobsf:
+    build:
+      context: .
+      dockerfile: Dockerfile.queue
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - mobsf_data:/home/mobsf/.MobSF
+    env_file:
+      - .env
+    environment:
+      - VALKEY_HOST=host.docker.internal
+      - MOBSF_API_KEY=${MOBSF_API_KEY}
+      # Map API_SCANNER_DB_* → POSTGRES_* which MobSF reads in settings.py
+      - POSTGRES_HOST=host.docker.internal
+      - POSTGRES_PORT=${API_SCANNER_DB_PORT:-5432}
+      - POSTGRES_USER=${API_SCANNER_DB_USERNAME:-postgres}
+      - POSTGRES_PASSWORD=${API_SCANNER_DB_PASSWORD:-postgres}
+      - POSTGRES_DB=${API_SCANNER_DB_DATABASE:-mudita_app_scanner}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/login/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  mobsf_data:
