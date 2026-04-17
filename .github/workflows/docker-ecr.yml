@@ -2,11 +2,11 @@ name: Build and Push Docker Image to ECR and Deploy
 
 on:
   push:
-    branches: ["dev", "main"]
+    branches: ["dev", "main", "prod"]
   workflow_dispatch:
     inputs:
       environment:
-        description: "Target environment (default: based on branch)"
+        description: "Optional override for manual run"
         type: choice
         required: false
         default: dev
@@ -42,10 +42,10 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "name=${{ inputs.environment }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            echo "name=prod" >> "$GITHUB_OUTPUT"
-          else
+          elif [ "${{ github.ref_name }}" = "dev" ]; then
             echo "name=dev" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=prod" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Configure AWS credentials (OIDC)
