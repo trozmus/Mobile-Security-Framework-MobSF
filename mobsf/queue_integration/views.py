@@ -76,7 +76,7 @@ class ErrorResponse(Schema):
 
 def _redis_opts() -> dict:
     """Get Redis/Valkey connection options with IAM auth support.
-    
+
     In production (NODE_ENV=prod), generates IAM auth token for MemoryDB.
     In local/dev, uses VALKEY_PASSWORD environment variable or defaults to empty.
     """
@@ -84,7 +84,7 @@ def _redis_opts() -> dict:
     port = int(os.getenv('VALKEY_PORT', '6379'))
     username = os.getenv('VALKEY_USERNAME', 'default')
     password = os.getenv('VALKEY_PASSWORD', '')
-    
+
     # In production, generate IAM auth token for MemoryDB
     if should_use_iam_auth() and not password:
         try:
@@ -92,10 +92,11 @@ def _redis_opts() -> dict:
             password = get_memorydb_auth_token()
             logger.info(f'[VALKEY_AUTH_OK] IAM token generated for user={username}')
         except Exception as e:
-            logger.error(f'[VALKEY_AUTH_ERROR] Failed to generate IAM token: {type(e).__name__}: {e}')
+            logger.error(
+                f'[VALKEY_AUTH_ERROR] Failed to generate IAM token: {type(e).__name__}: {e}')
             logger.warning('[VALKEY_AUTH_FALLBACK] Falling back to VALKEY_PASSWORD')
             password = os.getenv('VALKEY_PASSWORD', '')
-    
+
     opts = {
         'host': host,
         'port': port,
@@ -117,7 +118,7 @@ def _get_output_queue() -> str:
 
 async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
     """Push job to BullMQ queue with timeout protection.
-    
+
     Args:
         process_id: Unique process identifier
         url: URL to download APK from
@@ -142,11 +143,12 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
 
     try:
         logger.debug(f'[QUEUE_ADD_START] Adding job to queue "{queue_name}"...')
-        
+
         # Add timeout protection for queue.add operation
         try:
             job = await asyncio.wait_for(
-                q.add('app-binary-scan-requested', {'processID': process_id, 'url': url}),
+                q.add('app-binary-scan-requested',
+                      {'processID': process_id, 'url': url}),
                 timeout=timeout
             )
             elapsed = time.time() - start_time
@@ -157,7 +159,7 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
             logger.error(
                 f'[QUEUE_ADD_TIMEOUT] Queue add operation timed out after {timeout}s | elapsed={elapsed:.2f}s | processID={process_id} | queue={queue_name}')
             raise TimeoutError(f'Queue add operation timed out after {timeout}s')
-            
+
     except TimeoutError:
         raise
     except Exception as e:
