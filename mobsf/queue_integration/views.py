@@ -75,26 +75,42 @@ class ErrorResponse(Schema):
 # ---------------------------------------------------------------------------
 
 def _redis_opts() -> dict:
-    """Get Redis/Valkey connection options with IAM auth support.
+    """Get Redis/Valkey connection options with production-grade security.
 
-    In production (NODE_ENV=prod), generates IAM auth token for MemoryDB.
-    In local/dev, uses VALKEY_PASSWORD environment variable or defaults to empty.
+    In production (NODE_ENV=prod):
+    - Fetches password from AWS Secrets Manager
+    - Enables SSL/TLS encryption
+    - Adds connection timeouts (5s connect, 10s read)
+    - Enables keep-alive and health checks
+    - Enables retry on timeout
+
+    In local/dev:
+    - Uses VALKEY_PASSWORD environment variable or defaults to empty
+    - No SSL by default
     """
     host = os.getenv('VALKEY_HOST', 'localhost')
     port = int(os.getenv('VALKEY_PORT', '6379'))
     username = os.getenv('VALKEY_USERNAME', 'default')
     password = os.getenv('VALKEY_PASSWORD', '')
+    use_iam = should_use_iam_auth()
 
-    # In production, generate IAM auth token for MemoryDB
-    if should_use_iam_auth() and not password:
+    # In production, fetch MemoryDB password from AWS Secrets Manager
+    if use_iam and not password:
         try:
-            logger.info('[VALKEY_AUTH] Generating IAM auth token for MemoryDB...')
+            logger.info(
+                '[VALKEY_AUTH] Fetching MemoryDB password from AWS Secrets Manager...')
+            logger.debug(
+                f'[VALKEY_AUTH] MEMORYDB_SECRET_NAME={os.getenv("MEMORYDB_SECRET_NAME")}, MEMORYDB_CLUSTER_NAME={os.getenv("MEMORYDB_CLUSTER_NAME")}')
             password = get_memorydb_auth_token()
-            logger.info(f'[VALKEY_AUTH_OK] IAM token generated for user={username}')
+            logger.info(
+                f'[VALKEY_AUTH_OK] MemoryDB password retrieved for user={username}')
         except Exception as e:
             logger.error(
-                f'[VALKEY_AUTH_ERROR] Failed to generate IAM token: {type(e).__name__}: {e}')
-            logger.warning('[VALKEY_AUTH_FALLBACK] Falling back to VALKEY_PASSWORD')
+                f'[VALKEY_AUTH_ERROR] Failed to fetch MemoryDB password: {type(e).__name__}: {e}')
+            logger.warning(
+                '[VALKEY_AUTH_FALLBACK] Falling back to environment variable VALKEY_PASSWORD')
+            logger.warning(
+                '[VALKEY_AUTH_HINT] Set MEMORYDB_SECRET_NAME or MEMORYDB_CLUSTER_NAME to fetch password from Secrets Manager')
             password = os.getenv('VALKEY_PASSWORD', '')
 
     opts = {
@@ -103,8 +119,31 @@ def _redis_opts() -> dict:
         'password': password,
         'username': username,
     }
+
+    # Add production-grade connection settings for MemoryDB/AWS environment
+    if use_iam:
+        opts.update({
+            'ssl': True,
+            'ssl_certfile': None,  # Use system CA certs
+            'ssl_keyfile': None,
+            'ssl_cert_reqs': 'required',
+            'ssl_check_hostname': True,
+            'ssl_ca_certs': None,
+            'socket_timeout': 10,  # Read timeout (seconds)
+            'socket_connect_timeout': 5,  # Connect timeout (seconds)
+            'socket_keepalive': True,
+            'health_check_interval': 30,  # Health check every 30s
+            'retry_on_timeout': True,
+        })
+        logger.debug(
+            '[REDIS_CONFIG] Production mode: SSL enabled, timeouts configured (connect=5s, read=10s)')
+    else:
+        # Local development: minimal config
+        logger.debug('[REDIS_CONFIG] Development mode: no SSL, default timeouts')
+
+    auth_source = 'secrets_manager' if (use_iam and password) else 'env'
     logger.debug(
-        f'[REDIS_CONFIG] host={opts["host"]}:{opts["port"]}, username={opts["username"]}, password_set={bool(opts["password"])}, auth_source={"iam" if should_use_iam_auth() else "env"}')
+        f'[REDIS_CONFIG] host={opts["host"]}:{opts["port"]}, username={opts["username"]}, password_set={bool(password)}, auth_source={auth_source}')
     return opts
 
 
