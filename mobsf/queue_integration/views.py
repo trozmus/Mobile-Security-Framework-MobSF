@@ -9,6 +9,7 @@ OpenAPI JSON: /api/queue/openapi.json
 import asyncio
 import logging
 import os
+import time
 
 from ninja import NinjaAPI, Schema
 from ninja.responses import codes_4xx, codes_5xx
@@ -16,6 +17,7 @@ from ninja.responses import codes_4xx, codes_5xx
 from bullmq import Queue
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 api = NinjaAPI(
     title='MobSF Queue Integration API',
@@ -68,12 +70,15 @@ class ErrorResponse(Schema):
 # ---------------------------------------------------------------------------
 
 def _redis_opts() -> dict:
-    return {
+    opts = {
         'host': os.getenv('VALKEY_HOST', 'localhost'),
         'port': int(os.getenv('VALKEY_PORT', '6379')),
         'password': os.getenv('VALKEY_PASSWORD', ''),
         'username': os.getenv('VALKEY_USERNAME', 'default'),
     }
+    logger.debug(
+        f'[REDIS_CONFIG] host={opts["host"]}:{opts["port"]}, username={opts["username"]}, password_set={bool(opts["password"])}')
+    return opts
 
 
 def _get_input_queue() -> str:
@@ -86,11 +91,46 @@ def _get_output_queue() -> str:
 
 async def _push_to_queue(process_id: str, url: str) -> None:
     queue_name = _get_input_queue()
-    q = Queue(queue_name, {'connection': _redis_opts()})
+    logger.debug(
+        f'[ASYNC_PUSH_START] processID={process_id}, queue={queue_name}, url={url}')
+
+    start_time = time.time()
+    redis_opts = _redis_opts()
+
+    logger.debug(
+        f'[REDIS_CONNECT] Attempting connection to {redis_opts["host"]}:{redis_opts["port"]}...')
     try:
+        q = Queue(queue_name, {'connection': redis_opts})
+        logger.debug(f'[REDIS_CONNECT_OK] Queue object created successfully')
+    except Exception as e:
+        logger.error(
+            f'[REDIS_CONNECT_ERROR] Failed to create Queue object: {type(e).__name__}: {e}')
+        raise
+
+    try:
+        logger.debug(f'[QUEUE_ADD_START] Adding job to queue "{queue_name}"...')
         await q.add('app-binary-scan-requested', {'processID': process_id, 'url': url})
+        elapsed = time.time() - start_time
+        logger.info(
+            f'[QUEUE_ADD_OK] Job added successfully in {elapsed:.2f}s | processID={process_id} | queue={queue_name}')
+    except asyncio.TimeoutError:
+        elapsed = time.time() - start_time
+        logger.error(
+            f'[QUEUE_ADD_TIMEOUT] Timeout after {elapsed:.2f}s | processID={process_id} | queue={queue_name}')
+        raise
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logger.error(
+            f'[QUEUE_ADD_ERROR] Failed after {elapsed:.2f}s: {type(e).__name__}: {e} | processID={process_id}')
+        raise
     finally:
-        await q.close()
+        try:
+            logger.debug(f'[REDIS_CLOSE_START] Closing queue connection...')
+            await q.close()
+            logger.debug(f'[REDIS_CLOSE_OK] Queue connection closed')
+        except Exception as e:
+            logger.warning(
+                f'[REDIS_CLOSE_ERROR] Error closing queue: {type(e).__name__}: {e}')
 
 
 # ---------------------------------------------------------------------------
@@ -109,15 +149,37 @@ async def _push_to_queue(process_id: str, url: str) -> None:
     tags=['Queue'],
 )
 def push_scan_job(request, payload: ScanJobRequest):
+    request_id = f"{payload.processID}-{int(time.time()*1000)}"
+
+    logger.info(
+        f'[REQUEST_START] request_id={request_id} | processID={payload.processID} | url={payload.url}')
+    logger.debug(
+        f'[REQUEST_DETAILS] method={request.method}, path={request.path}, client_ip={request.META.get("REMOTE_ADDR")}')
+
     queue_name = _get_input_queue()
+    start_time = time.time()
+
     try:
+        logger.debug(
+            f'[ASYNCIO_RUN_START] request_id={request_id} | Starting async task...')
         asyncio.run(_push_to_queue(payload.processID, payload.url))
+        elapsed = time.time() - start_time
+        logger.info(
+            f'[REQUEST_SUCCESS] request_id={request_id} | Completed in {elapsed:.2f}s | processID={payload.processID}')
+
+    except asyncio.TimeoutError as exc:
+        elapsed = time.time() - start_time
+        logger.error(
+            f'[REQUEST_TIMEOUT] request_id={request_id} | Timeout after {elapsed:.2f}s | Error: {exc}')
+        return 504, ErrorResponse(error='timeout', message=f'Queue operation timed out after {elapsed:.2f}s')
     except Exception as exc:
-        logger.exception('Failed to push job to queue %s', queue_name)
+        elapsed = time.time() - start_time
+        logger.exception(
+            f'[REQUEST_ERROR] request_id={request_id} | Failed after {elapsed:.2f}s to push job to queue "{queue_name}"')
+        logger.error(
+            f'[ERROR_DETAILS] Exception type={type(exc).__name__}, Message={str(exc)}')
         return 500, ErrorResponse(error='queue_error', message=str(exc))
 
-    logger.info('Pushed job to queue %s | processID=%s | url=%s',
-                queue_name, payload.processID, payload.url)
     return 200, ScanJobQueued(
         status='queued',
         processID=payload.processID,
