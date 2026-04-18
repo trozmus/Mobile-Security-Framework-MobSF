@@ -21,6 +21,7 @@ RUN apt update -y && \
         android-sdk-build-tools \
         android-tools-adb \
         build-essential \
+        ca-certificates \
         curl \
         fontconfig \
         fontconfig-config \
