@@ -16,6 +16,11 @@ from ninja.responses import codes_4xx, codes_5xx
 
 from bullmq import Queue
 
+from mobsf.queue_integration.aws_auth import (
+    get_memorydb_auth_token,
+    should_use_iam_auth,
+)
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -70,14 +75,35 @@ class ErrorResponse(Schema):
 # ---------------------------------------------------------------------------
 
 def _redis_opts() -> dict:
+    """Get Redis/Valkey connection options with IAM auth support.
+    
+    In production (NODE_ENV=prod), generates IAM auth token for MemoryDB.
+    In local/dev, uses VALKEY_PASSWORD environment variable or defaults to empty.
+    """
+    host = os.getenv('VALKEY_HOST', 'localhost')
+    port = int(os.getenv('VALKEY_PORT', '6379'))
+    username = os.getenv('VALKEY_USERNAME', 'default')
+    password = os.getenv('VALKEY_PASSWORD', '')
+    
+    # In production, generate IAM auth token for MemoryDB
+    if should_use_iam_auth() and not password:
+        try:
+            logger.info('[VALKEY_AUTH] Generating IAM auth token for MemoryDB...')
+            password = get_memorydb_auth_token()
+            logger.info(f'[VALKEY_AUTH_OK] IAM token generated for user={username}')
+        except Exception as e:
+            logger.error(f'[VALKEY_AUTH_ERROR] Failed to generate IAM token: {type(e).__name__}: {e}')
+            logger.warning('[VALKEY_AUTH_FALLBACK] Falling back to VALKEY_PASSWORD')
+            password = os.getenv('VALKEY_PASSWORD', '')
+    
     opts = {
-        'host': os.getenv('VALKEY_HOST', 'localhost'),
-        'port': int(os.getenv('VALKEY_PORT', '6379')),
-        'password': os.getenv('VALKEY_PASSWORD', ''),
-        'username': os.getenv('VALKEY_USERNAME', 'default'),
+        'host': host,
+        'port': port,
+        'password': password,
+        'username': username,
     }
     logger.debug(
-        f'[REDIS_CONFIG] host={opts["host"]}:{opts["port"]}, username={opts["username"]}, password_set={bool(opts["password"])}')
+        f'[REDIS_CONFIG] host={opts["host"]}:{opts["port"]}, username={opts["username"]}, password_set={bool(opts["password"])}, auth_source={"iam" if should_use_iam_auth() else "env"}')
     return opts
 
 
@@ -89,10 +115,17 @@ def _get_output_queue() -> str:
     return os.getenv('QUEUE_OUTPUT', 'APP-SCANN-RESULT')
 
 
-async def _push_to_queue(process_id: str, url: str) -> None:
+async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
+    """Push job to BullMQ queue with timeout protection.
+    
+    Args:
+        process_id: Unique process identifier
+        url: URL to download APK from
+        timeout: Timeout in seconds (default 30s)
+    """
     queue_name = _get_input_queue()
     logger.debug(
-        f'[ASYNC_PUSH_START] processID={process_id}, queue={queue_name}, url={url}')
+        f'[ASYNC_PUSH_START] processID={process_id}, queue={queue_name}, url={url}, timeout={timeout}s')
 
     start_time = time.time()
     redis_opts = _redis_opts()
@@ -109,14 +142,23 @@ async def _push_to_queue(process_id: str, url: str) -> None:
 
     try:
         logger.debug(f'[QUEUE_ADD_START] Adding job to queue "{queue_name}"...')
-        await q.add('app-binary-scan-requested', {'processID': process_id, 'url': url})
-        elapsed = time.time() - start_time
-        logger.info(
-            f'[QUEUE_ADD_OK] Job added successfully in {elapsed:.2f}s | processID={process_id} | queue={queue_name}')
-    except asyncio.TimeoutError:
-        elapsed = time.time() - start_time
-        logger.error(
-            f'[QUEUE_ADD_TIMEOUT] Timeout after {elapsed:.2f}s | processID={process_id} | queue={queue_name}')
+        
+        # Add timeout protection for queue.add operation
+        try:
+            job = await asyncio.wait_for(
+                q.add('app-binary-scan-requested', {'processID': process_id, 'url': url}),
+                timeout=timeout
+            )
+            elapsed = time.time() - start_time
+            logger.info(
+                f'[QUEUE_ADD_OK] Job added successfully in {elapsed:.2f}s | processID={process_id} | queue={queue_name} | job_id={job.id if hasattr(job, "id") else "unknown"}')
+        except asyncio.TimeoutError:
+            elapsed = time.time() - start_time
+            logger.error(
+                f'[QUEUE_ADD_TIMEOUT] Queue add operation timed out after {timeout}s | elapsed={elapsed:.2f}s | processID={process_id} | queue={queue_name}')
+            raise TimeoutError(f'Queue add operation timed out after {timeout}s')
+            
+    except TimeoutError:
         raise
     except Exception as e:
         elapsed = time.time() - start_time
@@ -167,11 +209,16 @@ def push_scan_job(request, payload: ScanJobRequest):
         logger.info(
             f'[REQUEST_SUCCESS] request_id={request_id} | Completed in {elapsed:.2f}s | processID={payload.processID}')
 
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         elapsed = time.time() - start_time
         logger.error(
             f'[REQUEST_TIMEOUT] request_id={request_id} | Timeout after {elapsed:.2f}s | Error: {exc}')
-        return 504, ErrorResponse(error='timeout', message=f'Queue operation timed out after {elapsed:.2f}s')
+        return 504, ErrorResponse(error='timeout', message=f'Queue operation timed out: {str(exc)}')
+    except asyncio.TimeoutError as exc:
+        elapsed = time.time() - start_time
+        logger.error(
+            f'[REQUEST_TIMEOUT] request_id={request_id} | Asyncio timeout after {elapsed:.2f}s | Error: {exc}')
+        return 504, ErrorResponse(error='timeout', message='Queue operation timed out')
     except Exception as exc:
         elapsed = time.time() - start_time
         logger.exception(
