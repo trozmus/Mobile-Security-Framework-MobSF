@@ -64,7 +64,7 @@ bleach = "^6.2.0"
 bcrypt = "4.0.1" # Pinned to avoid warnings with mitmproxy 12
 bullmq = ">=2.0.0"
 django-ninja = ">=1.0.0"
-boto3 = {version = ">=1.26.0", optional = true}  # Required for AWS MemoryDB IAM auth
+boto3 = ">=1.26.0"  # Required for AWS MemoryDB IAM auth and RDS IAM auth
 
 [build-system]
 requires = ["poetry-core"]
