@@ -180,13 +180,25 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
     logger.debug(
         f'[REDIS_CONNECT] Attempting connection to {redis_opts["host"]}:{redis_opts["port"]}...')
     try:
-        # BullMQ requires async Redis client (redis.asyncio)
-        # Create async connection with IAM auth options
-        redis_client = redis.asyncio.Redis(**redis_opts)
+        # BullMQ expects a URL string with connection details
+        # Build rediss:// URL with IAM token as password
+        host = redis_opts['host']
+        port = redis_opts['port']
+        username = redis_opts.get('username', 'default')
+        password = redis_opts['password']
 
-        # Create Queue with async redis client
-        q = Queue(queue_name, {'connection': redis_client})
-        logger.debug(f'[REDIS_CONNECT_OK] Queue object created with async Redis client')
+        # URL encode password (token may contain special characters)
+        from urllib.parse import quote
+        encoded_password = quote(password, safe='')
+
+        # Use rediss:// for SSL connection
+        redis_url = f'rediss://{username}:{encoded_password}@{host}:{port}/0'
+        logger.debug(
+            f'[REDIS_CONNECT] Built connection URL: rediss://{username}:***@{host}:{port}/0')
+
+        # Create Queue with URL - bullmq will handle connection pool creation
+        q = Queue(queue_name, redis_url)
+        logger.debug(f'[REDIS_CONNECT_OK] Queue object created with URL connection')
     except Exception as e:
         logger.error(
             f'[REDIS_CONNECT_ERROR] Failed to create Queue object: {type(e).__name__}: {e}')
