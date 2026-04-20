@@ -91,27 +91,27 @@ def _redis_opts() -> dict:
     host = os.getenv('VALKEY_HOST', 'localhost')
     port = int(os.getenv('VALKEY_PORT', '6379'))
     username = os.getenv('VALKEY_USERNAME', 'default')
-    password = os.getenv('VALKEY_PASSWORD', '')
     use_iam = should_use_iam_auth()
 
-    # In production, fetch MemoryDB password from AWS Secrets Manager
-    if use_iam and not password:
-        try:
-            logger.info(
-                '[VALKEY_AUTH] Fetching MemoryDB password from AWS Secrets Manager...')
-            logger.debug(
-                f'[VALKEY_AUTH] MEMORYDB_SECRET_NAME={os.getenv("MEMORYDB_SECRET_NAME")}, MEMORYDB_CLUSTER_NAME={os.getenv("MEMORYDB_CLUSTER_NAME")}')
-            password = get_memorydb_auth_token()
-            logger.info(
-                f'[VALKEY_AUTH_OK] MemoryDB password retrieved for user={username}')
-        except Exception as e:
-            logger.error(
-                f'[VALKEY_AUTH_ERROR] Failed to fetch MemoryDB password: {type(e).__name__}: {e}')
-            logger.warning(
-                '[VALKEY_AUTH_FALLBACK] Falling back to environment variable VALKEY_PASSWORD')
-            logger.warning(
-                '[VALKEY_AUTH_HINT] Set MEMORYDB_SECRET_NAME or MEMORYDB_CLUSTER_NAME to fetch password from Secrets Manager')
-            password = os.getenv('VALKEY_PASSWORD', '')
+    # Get authentication credential (IAM token or static password)
+    try:
+        logger.debug(f'[REDIS_OPTS] Getting credential for user={username}, host={host}:{port}')
+        logger.debug(f'[REDIS_OPTS] Mode: {"IAM_TOKEN" if use_iam else "STATIC_PASSWORD"}')
+        if use_iam:
+            logger.debug(f'[REDIS_OPTS] Env - MEMORYDB_ENDPOINT={os.getenv("MEMORYDB_ENDPOINT")}')
+            logger.debug(f'[REDIS_OPTS] Env - MEMORYDB_ACL_USERNAME={os.getenv("MEMORYDB_ACL_USERNAME")}')
+            logger.debug(f'[REDIS_OPTS] Env - AWS_REGION={os.getenv("AWS_REGION")}')
+        else:
+            logger.debug(f'[REDIS_OPTS] Env - VALKEY_PASSWORD_SET={bool(os.getenv("VALKEY_PASSWORD"))}')
+            logger.debug(f'[REDIS_OPTS] Env - MEMORYDB_SECRET_NAME={os.getenv("MEMORYDB_SECRET_NAME")}')
+        
+        password = get_memorydb_auth_token()
+        logger.info(f'[REDIS_OPTS_OK] Credential obtained for user={username}')
+        
+    except Exception as e:
+        logger.error(f'[REDIS_OPTS_ERROR] Failed: {type(e).__name__}: {e}')
+        logger.error('[REDIS_OPTS_ERROR] Connection will fail', exc_info=True)
+        raise
 
     opts = {
         'host': host,
@@ -141,9 +141,14 @@ def _redis_opts() -> dict:
         # Local development: minimal config
         logger.debug('[REDIS_CONFIG] Development mode: no SSL, default timeouts')
 
-    auth_source = 'secrets_manager' if (use_iam and password) else 'env'
+    # Log final configuration summary
     logger.debug(
-        f'[REDIS_CONFIG] host={opts["host"]}:{opts["port"]}, username={opts["username"]}, password_set={bool(password)}, auth_source={auth_source}')
+        f'[REDIS_CONFIG] host={opts["host"]}:{opts["port"]}, '
+        f'username={opts["username"]}, '
+        f'password_length={len(password) if password else 0} chars, '
+        f'auth_mode={"IAM_TOKEN" if use_iam else "STATIC_PASSWORD"}, '
+        f'ssl={opts.get("ssl", False)}'
+    )
     return opts
 
 
