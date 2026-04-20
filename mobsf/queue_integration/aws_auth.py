@@ -7,32 +7,35 @@ Provides token generation for IAM-based authentication to AWS services.
 
 import logging
 import os
+from urllib.parse import urlencode, urlunparse, ParseResult
 
 logger = logging.getLogger(__name__)
 
 try:
     import boto3
     from botocore.exceptions import BotoCoreError, NoCredentialsError
+    from botocore.signers import RequestSigner
     BOTO3_AVAILABLE = True
 except ImportError:
     BOTO3_AVAILABLE = False
 
 
 def get_memorydb_iam_token() -> str:
-    """Generate MemoryDB IAM auth token (valid for 15 minutes).
+    """Generate MemoryDB IAM auth token via SigV4 presigned URL (valid for 15 minutes).
 
-    Uses AWS RDS API to generate short-lived token instead of static password.
-    Per AWS docs: MemoryDB IAM auth uses RDS client for token generation.
+    Uses AWS SigV4 RequestSigner to generate presigned URL that acts as auth token.
+    This is the official AWS method for MemoryDB IAM authentication.
 
     Requires:
     - MemoryDB cluster with IAM auth enabled
-    - Fargate task IAM role with rds:GenerateDbAuthToken permission
+    - Fargate task IAM role with memorydb:connect permission
     - IAM ACL user mapped to Fargate task role
     - VALKEY_HOST environment variable (cluster endpoint hostname)
     - VALKEY_USERNAME environment variable (IAM ACL username)
+    - MEMORYDB_CLUSTER_NAME environment variable (cluster name, e.g., mudita-appstore-prod-memorydb)
 
     Returns:
-        IAM auth token to use as Redis password (valid 15 min)
+        IAM auth token (presigned URL stripped of https://) - valid for 900s (15 min)
 
     Raises:
         ImportError: if boto3 not installed
@@ -45,46 +48,83 @@ def get_memorydb_iam_token() -> str:
         )
 
     region = os.getenv('AWS_REGION', 'us-east-1')
-    endpoint = os.getenv('VALKEY_HOST')
-    port = int(os.getenv('VALKEY_PORT', '6379'))
+    cluster_name = os.getenv('MEMORYDB_CLUSTER_NAME')
     username = os.getenv('VALKEY_USERNAME', 'default')
 
-    if not endpoint:
-        logger.error('[MEMORYDB_IAM] VALKEY_HOST not set')
+    if not cluster_name:
+        logger.error('[MEMORYDB_IAM] MEMORYDB_CLUSTER_NAME not set')
         logger.error(
-            '[MEMORYDB_IAM] Set it to cluster endpoint, e.g.: clustercfg.mudita-appstore-prod-memorydb.b5odpt.memorydb.eu-central-1.amazonaws.com')
+            '[MEMORYDB_IAM] Set it to cluster name, e.g.: mudita-appstore-prod-memorydb')
         raise ValueError(
-            'VALKEY_HOST environment variable is required for IAM token generation'
+            'MEMORYDB_CLUSTER_NAME environment variable is required for IAM token generation'
         )
 
     try:
         logger.debug(
-            f'[MEMORYDB_IAM] Starting token generation: endpoint={endpoint}:{port}, user={username}, region={region}')
+            f'[MEMORYDB_IAM] Starting SigV4 token generation: cluster={cluster_name}, user={username}, region={region}')
 
-        # Use RDS client (per AWS docs for MemoryDB IAM auth)
-        client = boto3.client('rds', region_name=region)
+        # Create MemoryDB client and get credentials for signing
+        session = boto3.Session(region_name=region)
+        client = session.client('memorydb')
+        credentials = session.get_credentials()
+        service_id = client.meta.service_model.service_id
+
         logger.debug(
-            f'[MEMORYDB_IAM] RDS client created for MemoryDB IAM token generation')
+            f'[MEMORYDB_IAM] MemoryDB client created, service_id={service_id}')
 
-        logger.debug(
-            f'[MEMORYDB_IAM] Calling generate_db_auth_token with DBHostname={endpoint}')
-
-        # Generate auth token (valid for 15 minutes)
-        token = client.generate_db_auth_token(
-            DBHostname=endpoint,
-            Port=port,
-            DBUsername=username,
-            Region=region,
+        # Create RequestSigner for SigV4 signing
+        signer = RequestSigner(
+            service_id=service_id,
+            region_name=region,
+            signing_name='memorydb',
+            signature_version='v4',
+            credentials=credentials,
+            event_emitter=session.events
         )
+        logger.debug('[MEMORYDB_IAM] RequestSigner created for SigV4 signing')
+
+        # Build presigned URL for MemoryDB connect action
+        query_params = {'Action': 'connect', 'User': username}
+
+        url = urlunparse(ParseResult(
+            scheme='https',
+            netloc=cluster_name,
+            path='/',
+            query=urlencode(query_params),
+            params='',
+            fragment=''
+        ))
+        logger.debug(f'[MEMORYDB_IAM] Built URL: {url}')
+
+        # Generate presigned URL (expires in 900s = 15 minutes)
+        request_dict = {
+            'method': 'GET',
+            'url': url,
+            'body': {},
+            'headers': {},
+            'context': {}
+        }
+
+        signed_url = signer.generate_presigned_url(
+            request_dict,
+            operation_name='connect',
+            expires_in=900,
+            region_name=region
+        )
+        logger.debug(
+            f'[MEMORYDB_IAM] Presigned URL generated, length={len(signed_url)} chars')
+
+        # Extract token from presigned URL (remove https:// prefix)
+        token = signed_url.replace('https://', '')
 
         if not token:
-            logger.error('[MEMORYDB_IAM] Empty token response from RDS API')
-            raise ValueError('Empty token response from RDS generate_db_auth_token()')
+            logger.error('[MEMORYDB_IAM] Empty token after URL stripping')
+            raise ValueError('Empty token after presigned URL stripping')
 
         logger.info(
-            f'[MEMORYDB_IAM] Token generated successfully for user={username}, endpoint={endpoint}')
+            f'[MEMORYDB_IAM] IAM token generated successfully for user={username}, cluster={cluster_name}')
         logger.debug(
-            f'[MEMORYDB_IAM] Token length={len(token)} chars, valid for 15 minutes')
+            f'[MEMORYDB_IAM] Token length={len(token)} chars, valid for 900s (15 minutes)')
         return token
 
     except BotoCoreError as e:
