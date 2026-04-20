@@ -28,7 +28,8 @@ def get_memorydb_iam_token() -> str:
     - MemoryDB cluster with IAM auth enabled
     - Fargate task IAM role with rds:GenerateDbAuthToken permission
     - IAM ACL user mapped to Fargate task role
-    - MEMORYDB_ENDPOINT environment variable (cluster endpoint hostname)
+    - VALKEY_HOST environment variable (cluster endpoint hostname)
+    - VALKEY_USERNAME environment variable (IAM ACL username)
 
     Returns:
         IAM auth token to use as Redis password (valid 15 min)
@@ -44,16 +45,16 @@ def get_memorydb_iam_token() -> str:
         )
 
     region = os.getenv('AWS_REGION', 'us-east-1')
-    endpoint = os.getenv('MEMORYDB_ENDPOINT')
+    endpoint = os.getenv('VALKEY_HOST')
     port = int(os.getenv('VALKEY_PORT', '6379'))
-    username = os.getenv('MEMORYDB_ACL_USERNAME', 'default')
+    username = os.getenv('VALKEY_USERNAME', 'default')
 
     if not endpoint:
-        logger.error('[MEMORYDB_IAM] MEMORYDB_ENDPOINT not set')
+        logger.error('[MEMORYDB_IAM] VALKEY_HOST not set')
         logger.error(
             '[MEMORYDB_IAM] Set it to cluster endpoint, e.g.: clustercfg.mudita-appstore-prod-memorydb.b5odpt.memorydb.eu-central-1.amazonaws.com')
         raise ValueError(
-            'MEMORYDB_ENDPOINT environment variable is required for IAM token generation'
+            'VALKEY_HOST environment variable is required for IAM token generation'
         )
 
     try:
