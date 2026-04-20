@@ -180,32 +180,29 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
     logger.debug(
         f'[REDIS_CONNECT] Attempting connection to {redis_opts["host"]}:{redis_opts["port"]}...')
     try:
-        # For MemoryDB in cluster mode, use regular Redis client with cluster detection disabled
-        # This is bullmq-compatible and handles Lua scripts properly
+        # For MemoryDB in cluster mode, use simple Redis URL without cluster params
+        # redis-py won't auto-detect cluster mode on simple URL, bullmq handles it fine
         host = redis_opts['host']
         port = redis_opts['port']
         username = redis_opts.get('username', 'default')
         password = redis_opts['password']
-        use_ssl = redis_opts.get('ssl', False)
-        ssl_cert_reqs = redis_opts.get('ssl_cert_reqs', None)
-        socket_timeout = redis_opts.get('socket_timeout', 10)
 
         logger.debug(
-            f'[REDIS_CONNECT] Creating async Redis connection (cluster mode disabled)')
+            f'[REDIS_CONNECT] Creating async Redis connection (simple URL)')
 
-        # Build URL with skip_full_coverage_check for bullmq to parse
+        # Build URL without cluster-specific params
         from urllib.parse import quote
         encoded_password = quote(password, safe='')
 
-        # Use rediss:// for SSL, with skip_full_coverage_check query param
-        redis_url = f'rediss://{username}:{encoded_password}@{host}:{port}/0?skip_full_coverage_check=true'
+        # Use rediss:// for SSL connection
+        redis_url = f'rediss://{username}:{encoded_password}@{host}:{port}/0'
         logger.debug(
-            f'[REDIS_CONNECT] Built connection URL: rediss://{username}:***@{host}:{port}/0?skip_full_coverage_check=true')
+            f'[REDIS_CONNECT] Built connection URL: rediss://{username}:***@{host}:{port}/0')
 
-        # Create Queue with URL - bullmq will parse and disable cluster mode detection
+        # Create Queue with URL - redis-py will use simple client without cluster detection
         q = Queue(queue_name, {'connection': redis_url})
         logger.debug(
-            f'[REDIS_CONNECT_OK] Queue object created with URL (cluster mode handling disabled)')
+            f'[REDIS_CONNECT_OK] Queue object created with simple Redis connection')
     except Exception as e:
         logger.error(
             f'[REDIS_CONNECT_ERROR] Failed to create Queue object: {type(e).__name__}: {e}')
