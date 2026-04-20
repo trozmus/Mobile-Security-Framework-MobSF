@@ -140,12 +140,11 @@ def _redis_opts() -> dict:
             'ssl_cert_reqs': 'required',
             'ssl_check_hostname': True,
             'ssl_ca_certs': None,
-            'socket_timeout': 10,  # Read timeout (seconds)
-            'connect_timeout': 5,  # Connection timeout (seconds)
+            'socket_timeout': 10,  # Socket timeout for both connect and read (seconds)
             'decode_responses': False,  # Keep binary for performance
         })
         logger.debug(
-            '[REDIS_CONFIG] Production mode: SSL enabled, timeouts configured (connect=5s, read=10s)')
+            '[REDIS_CONFIG] Production mode: SSL enabled, socket_timeout=10s')
     else:
         # Local development: minimal config
         logger.debug('[REDIS_CONFIG] Development mode: no SSL, default timeouts')
