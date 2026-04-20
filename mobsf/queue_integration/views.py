@@ -180,18 +180,32 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
     logger.debug(
         f'[REDIS_CONNECT] Attempting connection to {redis_opts["host"]}:{redis_opts["port"]}...')
     try:
-        # BullMQ with MemoryDB in cluster mode requires skip_full_coverage_check
-        # to prevent cluster slot mismatch errors on Lua scripts
-        redis_opts['skip_full_coverage_check'] = True
+        # For MemoryDB in cluster mode, use regular Redis client with cluster detection disabled
+        # This is bullmq-compatible and handles Lua scripts properly
+        host = redis_opts['host']
+        port = redis_opts['port']
+        username = redis_opts.get('username', 'default')
+        password = redis_opts['password']
+        use_ssl = redis_opts.get('ssl', False)
+        ssl_cert_reqs = redis_opts.get('ssl_cert_reqs', None)
+        socket_timeout = redis_opts.get('socket_timeout', 10)
 
-        # Create async Redis client with cluster mode detection disabled
-        redis_client = redis.asyncio.Redis(**redis_opts)
         logger.debug(
-            f'[REDIS_CONNECT] Async Redis client created with skip_full_coverage_check=True')
+            f'[REDIS_CONNECT] Creating async Redis connection (cluster mode disabled)')
 
-        # Create Queue with async redis client
-        q = Queue(queue_name, {'connection': redis_client})
-        logger.debug(f'[REDIS_CONNECT_OK] Queue object created with async Redis client')
+        # Build URL with skip_full_coverage_check for bullmq to parse
+        from urllib.parse import quote
+        encoded_password = quote(password, safe='')
+
+        # Use rediss:// for SSL, with skip_full_coverage_check query param
+        redis_url = f'rediss://{username}:{encoded_password}@{host}:{port}/0?skip_full_coverage_check=true'
+        logger.debug(
+            f'[REDIS_CONNECT] Built connection URL: rediss://{username}:***@{host}:{port}/0?skip_full_coverage_check=true')
+
+        # Create Queue with URL - bullmq will parse and disable cluster mode detection
+        q = Queue(queue_name, {'connection': redis_url})
+        logger.debug(
+            f'[REDIS_CONNECT_OK] Queue object created with URL (cluster mode handling disabled)')
     except Exception as e:
         logger.error(
             f'[REDIS_CONNECT_ERROR] Failed to create Queue object: {type(e).__name__}: {e}')
