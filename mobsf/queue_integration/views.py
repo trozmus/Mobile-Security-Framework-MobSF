@@ -11,6 +11,7 @@ import logging
 import os
 import time
 
+import redis
 from ninja import NinjaAPI, Schema
 from ninja.responses import codes_4xx, codes_5xx
 
@@ -190,7 +191,15 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
     logger.debug(
         f'[REDIS_CONNECT] Attempting connection to {redis_opts["host"]}:{redis_opts["port"]}...')
     try:
-        q = Queue(queue_name, {'connection': redis_opts})
+        # Create actual Redis connection object with options
+        redis_client = redis.Redis(**redis_opts)
+        
+        # Test connection with PING
+        redis_client.ping()
+        logger.debug(f'[REDIS_CONNECT_OK] Redis connection established and authenticated')
+        
+        # Create Queue with connection object (not dict)
+        q = Queue(queue_name, {'connection': redis_client})
         logger.debug(f'[REDIS_CONNECT_OK] Queue object created successfully')
     except Exception as e:
         logger.error(
