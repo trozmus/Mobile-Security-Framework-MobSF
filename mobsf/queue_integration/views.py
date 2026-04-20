@@ -124,27 +124,19 @@ def _redis_opts() -> dict:
         'host': host,
         'port': port,
         'password': password,
+        'username': username,  # Required for both IAM and static auth
     }
-
-    # For MemoryDB IAM auth: send only token as password, NO username
-    # For static password mode: include username
-    if not use_iam:
-        opts['username'] = username
 
     # Add production-grade connection settings for MemoryDB/AWS environment
     if use_iam:
         opts.update({
             'ssl': True,
-            'ssl_certfile': None,  # Use system CA certs
-            'ssl_keyfile': None,
-            'ssl_cert_reqs': 'required',
-            'ssl_check_hostname': True,
-            'ssl_ca_certs': None,
+            'ssl_cert_reqs': None,  # Per AWS docs for MemoryDB IAM auth
             'socket_timeout': 10,  # Socket timeout for both connect and read (seconds)
             'decode_responses': False,  # Keep binary for performance
         })
         logger.debug(
-            '[REDIS_CONFIG] Production mode: SSL enabled, socket_timeout=10s')
+            '[REDIS_CONFIG] Production mode: SSL enabled (IAM auth), socket_timeout=10s')
     else:
         # Local development: minimal config
         logger.debug('[REDIS_CONFIG] Development mode: no SSL, default timeouts')
@@ -152,12 +144,11 @@ def _redis_opts() -> dict:
     # Log final configuration summary
     config_log = (
         f'[REDIS_CONFIG] host={opts["host"]}:{opts["port"]}, '
+        f'username={opts.get("username", "default")}, '
         f'password_length={len(password) if password else 0} chars, '
         f'auth_mode={"IAM_TOKEN" if use_iam else "STATIC_PASSWORD"}, '
         f'ssl={opts.get("ssl", False)}'
     )
-    if not use_iam:
-        config_log += f', username={opts.get("username", "default")}'
     logger.debug(config_log)
     return opts
 
