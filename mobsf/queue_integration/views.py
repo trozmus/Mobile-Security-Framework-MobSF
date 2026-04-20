@@ -196,8 +196,8 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
         logger.debug(
             f'[REDIS_CONNECT] Built connection URL: rediss://{username}:***@{host}:{port}/0')
 
-        # Create Queue with URL - bullmq will handle connection pool creation
-        q = Queue(queue_name, redis_url)
+        # Create Queue with URL wrapped in connection dict
+        q = Queue(queue_name, {'connection': redis_url})
         logger.debug(f'[REDIS_CONNECT_OK] Queue object created with URL connection')
     except Exception as e:
         logger.error(
