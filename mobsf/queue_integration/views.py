@@ -112,7 +112,7 @@ def _redis_opts() -> dict:
                 f'[REDIS_OPTS] Env - MEMORYDB_SECRET_NAME={os.getenv("MEMORYDB_SECRET_NAME")}')
 
         password = get_memorydb_auth_token()
-        logger.info(f'[REDIS_OPTS_OK] Credential obtained for user={username}')
+        logger.info(f'[REDIS_OPTS_OK] Credential obtained')
 
     except Exception as e:
         logger.error(f'[REDIS_OPTS_ERROR] Failed: {type(e).__name__}: {e}')
@@ -123,8 +123,12 @@ def _redis_opts() -> dict:
         'host': host,
         'port': port,
         'password': password,
-        'username': username,
     }
+
+    # For MemoryDB IAM auth: send only token as password, NO username
+    # For static password mode: include username
+    if not use_iam:
+        opts['username'] = username
 
     # Add production-grade connection settings for MemoryDB/AWS environment
     if use_iam:
@@ -148,13 +152,15 @@ def _redis_opts() -> dict:
         logger.debug('[REDIS_CONFIG] Development mode: no SSL, default timeouts')
 
     # Log final configuration summary
-    logger.debug(
+    config_log = (
         f'[REDIS_CONFIG] host={opts["host"]}:{opts["port"]}, '
-        f'username={opts["username"]}, '
         f'password_length={len(password) if password else 0} chars, '
         f'auth_mode={"IAM_TOKEN" if use_iam else "STATIC_PASSWORD"}, '
         f'ssl={opts.get("ssl", False)}'
     )
+    if not use_iam:
+        config_log += f', username={opts.get("username", "default")}'
+    logger.debug(config_log)
     return opts
 
 
