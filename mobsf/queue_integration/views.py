@@ -180,25 +180,18 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
     logger.debug(
         f'[REDIS_CONNECT] Attempting connection to {redis_opts["host"]}:{redis_opts["port"]}...')
     try:
-        # BullMQ expects a URL string with connection details
-        # Build rediss:// URL with IAM token as password
-        host = redis_opts['host']
-        port = redis_opts['port']
-        username = redis_opts.get('username', 'default')
-        password = redis_opts['password']
+        # BullMQ with MemoryDB in cluster mode requires skip_full_coverage_check
+        # to prevent cluster slot mismatch errors on Lua scripts
+        redis_opts['skip_full_coverage_check'] = True
 
-        # URL encode password (token may contain special characters)
-        from urllib.parse import quote
-        encoded_password = quote(password, safe='')
-
-        # Use rediss:// for SSL connection
-        redis_url = f'rediss://{username}:{encoded_password}@{host}:{port}/0'
+        # Create async Redis client with cluster mode detection disabled
+        redis_client = redis.asyncio.Redis(**redis_opts)
         logger.debug(
-            f'[REDIS_CONNECT] Built connection URL: rediss://{username}:***@{host}:{port}/0')
+            f'[REDIS_CONNECT] Async Redis client created with skip_full_coverage_check=True')
 
-        # Create Queue with URL wrapped in connection dict
-        q = Queue(queue_name, {'connection': redis_url})
-        logger.debug(f'[REDIS_CONNECT_OK] Queue object created with URL connection')
+        # Create Queue with async redis client
+        q = Queue(queue_name, {'connection': redis_client})
+        logger.debug(f'[REDIS_CONNECT_OK] Queue object created with async Redis client')
     except Exception as e:
         logger.error(
             f'[REDIS_CONNECT_ERROR] Failed to create Queue object: {type(e).__name__}: {e}')
