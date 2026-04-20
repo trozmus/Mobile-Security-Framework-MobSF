@@ -101,9 +101,9 @@ def _redis_opts() -> dict:
             f'[REDIS_OPTS] Mode: {"IAM_TOKEN" if use_iam else "STATIC_PASSWORD"}')
         if use_iam:
             logger.debug(
-                f'[REDIS_OPTS] Env - MEMORYDB_ENDPOINT={os.getenv("MEMORYDB_ENDPOINT")}')
+                f'[REDIS_OPTS] Env - VALKEY_HOST={host}')
             logger.debug(
-                f'[REDIS_OPTS] Env - MEMORYDB_ACL_USERNAME={os.getenv("MEMORYDB_ACL_USERNAME")}')
+                f'[REDIS_OPTS] Env - VALKEY_USERNAME={username}')
             logger.debug(f'[REDIS_OPTS] Env - AWS_REGION={os.getenv("AWS_REGION")}')
         else:
             logger.debug(
