@@ -12,6 +12,7 @@ import os
 import time
 
 import redis
+import redis.asyncio
 from ninja import NinjaAPI, Schema
 from ninja.responses import codes_4xx, codes_5xx
 
@@ -179,10 +180,13 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
     logger.debug(
         f'[REDIS_CONNECT] Attempting connection to {redis_opts["host"]}:{redis_opts["port"]}...')
     try:
-        # BullMQ will handle connection creation and authentication
-        # Pass options dict directly to Queue
-        q = Queue(queue_name, redis_opts)
-        logger.debug(f'[REDIS_CONNECT_OK] Queue object created with options')
+        # BullMQ requires async Redis client (redis.asyncio)
+        # Create async connection with IAM auth options
+        redis_client = redis.asyncio.Redis(**redis_opts)
+
+        # Create Queue with async redis client
+        q = Queue(queue_name, {'connection': redis_client})
+        logger.debug(f'[REDIS_CONNECT_OK] Queue object created with async Redis client')
     except Exception as e:
         logger.error(
             f'[REDIS_CONNECT_ERROR] Failed to create Queue object: {type(e).__name__}: {e}')
