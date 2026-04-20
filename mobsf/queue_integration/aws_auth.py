@@ -50,20 +50,24 @@ def get_memorydb_iam_token() -> str:
 
     if not endpoint:
         logger.error('[MEMORYDB_IAM] MEMORYDB_ENDPOINT not set')
-        logger.error('[MEMORYDB_IAM] Set it to cluster endpoint, e.g.: clustercfg.mudita-appstore-prod-memorydb.b5odpt.memorydb.eu-central-1.amazonaws.com')
+        logger.error(
+            '[MEMORYDB_IAM] Set it to cluster endpoint, e.g.: clustercfg.mudita-appstore-prod-memorydb.b5odpt.memorydb.eu-central-1.amazonaws.com')
         raise ValueError(
             'MEMORYDB_ENDPOINT environment variable is required for IAM token generation'
         )
 
     try:
-        logger.debug(f'[MEMORYDB_IAM] Starting token generation: endpoint={endpoint}:{port}, user={username}, region={region}')
-        
+        logger.debug(
+            f'[MEMORYDB_IAM] Starting token generation: endpoint={endpoint}:{port}, user={username}, region={region}')
+
         # Use RDS client (per AWS docs for MemoryDB IAM auth)
         client = boto3.client('rds', region_name=region)
-        logger.debug(f'[MEMORYDB_IAM] RDS client created for MemoryDB IAM token generation')
-        
-        logger.debug(f'[MEMORYDB_IAM] Calling generate_db_auth_token with DBHostname={endpoint}')
-        
+        logger.debug(
+            f'[MEMORYDB_IAM] RDS client created for MemoryDB IAM token generation')
+
+        logger.debug(
+            f'[MEMORYDB_IAM] Calling generate_db_auth_token with DBHostname={endpoint}')
+
         # Generate auth token (valid for 15 minutes)
         token = client.generate_db_auth_token(
             DBHostname=endpoint,
@@ -71,21 +75,25 @@ def get_memorydb_iam_token() -> str:
             DBUsername=username,
             Region=region,
         )
-        
+
         if not token:
             logger.error('[MEMORYDB_IAM] Empty token response from RDS API')
             raise ValueError('Empty token response from RDS generate_db_auth_token()')
-        
-        logger.info(f'[MEMORYDB_IAM] Token generated successfully for user={username}, endpoint={endpoint}')
-        logger.debug(f'[MEMORYDB_IAM] Token length={len(token)} chars, valid for 15 minutes')
+
+        logger.info(
+            f'[MEMORYDB_IAM] Token generated successfully for user={username}, endpoint={endpoint}')
+        logger.debug(
+            f'[MEMORYDB_IAM] Token length={len(token)} chars, valid for 15 minutes')
         return token
-        
+
     except BotoCoreError as e:
         logger.error(f'[MEMORYDB_IAM] BotoCoreError: {type(e).__name__}: {e}')
-        logger.error('[MEMORYDB_IAM] Check: AWS credentials available? IAM role has rds:GenerateDbAuthToken permission? Endpoint correct?')
+        logger.error(
+            '[MEMORYDB_IAM] Check: AWS credentials available? IAM role has rds:GenerateDbAuthToken permission? Endpoint correct?')
         raise
     except Exception as e:
-        logger.error(f'[MEMORYDB_IAM] Failed to generate token: {type(e).__name__}: {e}')
+        logger.error(
+            f'[MEMORYDB_IAM] Failed to generate token: {type(e).__name__}: {e}')
         logger.error('[MEMORYDB_IAM] Traceback:', exc_info=True)
         raise
 
@@ -124,13 +132,15 @@ def get_memorydb_password_from_secrets() -> str:
             logger.debug(f'[MEMORYDB_SECRET] Using derived secret name: {secret_name}')
 
     if not secret_name:
-        logger.error('[MEMORYDB_SECRET] No MEMORYDB_SECRET_NAME or MEMORYDB_CLUSTER_NAME set')
+        logger.error(
+            '[MEMORYDB_SECRET] No MEMORYDB_SECRET_NAME or MEMORYDB_CLUSTER_NAME set')
         raise ValueError(
             'VALKEY_PASSWORD, MEMORYDB_SECRET_NAME, or MEMORYDB_CLUSTER_NAME required'
         )
 
     try:
-        logger.debug(f'[MEMORYDB_SECRET] Fetching secret from Secrets Manager: {secret_name}')
+        logger.debug(
+            f'[MEMORYDB_SECRET] Fetching secret from Secrets Manager: {secret_name}')
         client = boto3.client('secretsmanager', region_name=region)
         response = client.get_secret_value(SecretId=secret_name)
         logger.debug('[MEMORYDB_SECRET] Secret retrieved')
@@ -194,7 +204,8 @@ def get_memorydb_auth_token() -> str:
         BotoCoreError: if AWS credentials unavailable
     """
     use_iam = should_use_iam_auth()
-    logger.debug(f'[MEMORYDB_AUTH] Auth mode: {"IAM_TOKEN" if use_iam else "LOCAL_PASSWORD"}')
+    logger.debug(
+        f'[MEMORYDB_AUTH] Auth mode: {"IAM_TOKEN" if use_iam else "LOCAL_PASSWORD"}')
 
     # Production: Use IAM token
     if use_iam:
@@ -202,13 +213,15 @@ def get_memorydb_auth_token() -> str:
         try:
             return get_memorydb_iam_token()
         except Exception as e:
-            logger.warning(f'[MEMORYDB_AUTH] IAM token generation failed: {type(e).__name__}: {e}')
+            logger.warning(
+                f'[MEMORYDB_AUTH] IAM token generation failed: {type(e).__name__}: {e}')
             logger.warning('[MEMORYDB_AUTH] Attempting fallback to Secrets Manager...')
             # Fallback to Secrets Manager
             try:
                 return get_memorydb_password_from_secrets()
             except Exception as e2:
-                logger.error(f'[MEMORYDB_AUTH] Fallback also failed: {type(e2).__name__}: {e2}')
+                logger.error(
+                    f'[MEMORYDB_AUTH] Fallback also failed: {type(e2).__name__}: {e2}')
                 raise
 
     # Local/dev: Use static password
@@ -305,18 +318,22 @@ def get_memorydb_connection():
     # Fetch authentication credential (IAM token or password)
     if should_use_iam_auth():
         try:
-            logger.debug('[MEMORYDB_CONN] Production mode: attempting IAM token generation...')
+            logger.debug(
+                '[MEMORYDB_CONN] Production mode: attempting IAM token generation...')
             password = get_memorydb_auth_token()
-            logger.debug('[MEMORYDB_CONN] Authentication credential retrieved (IAM token)')
+            logger.debug(
+                '[MEMORYDB_CONN] Authentication credential retrieved (IAM token)')
         except Exception as e:
             logger.error(
                 f'[MEMORYDB_CONN] Failed to get credential: {type(e).__name__}: {e}')
             raise
     else:
         try:
-            logger.debug('[MEMORYDB_CONN] Local mode: attempting to get static password...')
+            logger.debug(
+                '[MEMORYDB_CONN] Local mode: attempting to get static password...')
             password = get_memorydb_auth_token()
-            logger.debug('[MEMORYDB_CONN] Authentication credential retrieved (static password)')
+            logger.debug(
+                '[MEMORYDB_CONN] Authentication credential retrieved (static password)')
         except Exception as e:
             logger.error(
                 f'[MEMORYDB_CONN] Failed to get credential: {type(e).__name__}: {e}')
@@ -349,7 +366,7 @@ def get_memorydb_connection():
             'retry_on_timeout': True,
             'max_connections': 50,
         }
-        
+
         # Add SSL settings for production
         if use_ssl:
             conn_kwargs.update({
@@ -366,7 +383,7 @@ def get_memorydb_connection():
             logger.debug('[MEMORYDB_CONN] Local mode: SSL disabled')
 
         logger.debug(f'[MEMORYDB_CONN] Connection kwargs: {list(conn_kwargs.keys())}')
-        
+
         logger.debug('[MEMORYDB_CONN] Creating Redis connection object...')
         connection = redis.Redis(**conn_kwargs)
 

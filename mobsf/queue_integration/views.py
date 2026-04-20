@@ -95,19 +95,25 @@ def _redis_opts() -> dict:
 
     # Get authentication credential (IAM token or static password)
     try:
-        logger.debug(f'[REDIS_OPTS] Getting credential for user={username}, host={host}:{port}')
-        logger.debug(f'[REDIS_OPTS] Mode: {"IAM_TOKEN" if use_iam else "STATIC_PASSWORD"}')
+        logger.debug(
+            f'[REDIS_OPTS] Getting credential for user={username}, host={host}:{port}')
+        logger.debug(
+            f'[REDIS_OPTS] Mode: {"IAM_TOKEN" if use_iam else "STATIC_PASSWORD"}')
         if use_iam:
-            logger.debug(f'[REDIS_OPTS] Env - MEMORYDB_ENDPOINT={os.getenv("MEMORYDB_ENDPOINT")}')
-            logger.debug(f'[REDIS_OPTS] Env - MEMORYDB_ACL_USERNAME={os.getenv("MEMORYDB_ACL_USERNAME")}')
+            logger.debug(
+                f'[REDIS_OPTS] Env - MEMORYDB_ENDPOINT={os.getenv("MEMORYDB_ENDPOINT")}')
+            logger.debug(
+                f'[REDIS_OPTS] Env - MEMORYDB_ACL_USERNAME={os.getenv("MEMORYDB_ACL_USERNAME")}')
             logger.debug(f'[REDIS_OPTS] Env - AWS_REGION={os.getenv("AWS_REGION")}')
         else:
-            logger.debug(f'[REDIS_OPTS] Env - VALKEY_PASSWORD_SET={bool(os.getenv("VALKEY_PASSWORD"))}')
-            logger.debug(f'[REDIS_OPTS] Env - MEMORYDB_SECRET_NAME={os.getenv("MEMORYDB_SECRET_NAME")}')
-        
+            logger.debug(
+                f'[REDIS_OPTS] Env - VALKEY_PASSWORD_SET={bool(os.getenv("VALKEY_PASSWORD"))}')
+            logger.debug(
+                f'[REDIS_OPTS] Env - MEMORYDB_SECRET_NAME={os.getenv("MEMORYDB_SECRET_NAME")}')
+
         password = get_memorydb_auth_token()
         logger.info(f'[REDIS_OPTS_OK] Credential obtained for user={username}')
-        
+
     except Exception as e:
         logger.error(f'[REDIS_OPTS_ERROR] Failed: {type(e).__name__}: {e}')
         logger.error('[REDIS_OPTS_ERROR] Connection will fail', exc_info=True)
