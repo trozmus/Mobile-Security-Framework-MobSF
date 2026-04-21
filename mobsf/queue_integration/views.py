@@ -204,18 +204,13 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
             password=password,
             ssl=use_ssl,
             ssl_cert_reqs=ssl_cert_reqs,
-            skip_full_coverage_check=True,  # AWS recommends this for single-shard cluster
             decode_responses=False,  # BullMQ works with binary (msgpack)
         )
         logger.debug(f'[REDIS_CONNECT_OK] RedisCluster connection created')
 
-        # Wrap queue name in curly braces {} for hash slot consistency in cluster mode
-        queue_name_cluster = f'{{{queue_name}}}'
-        logger.debug(
-            f'[REDIS_CONNECT] Using cluster-mode queue name: {queue_name_cluster}')
-
         # Create Queue with RedisCluster connection
-        q = Queue(queue_name_cluster, connection=redis_client)
+        # queue_name already contains braces from .env (e.g., {app-scanner-requests})
+        q = Queue(queue_name, connection=redis_client)
         logger.debug(
             f'[REDIS_CONNECT_OK] Queue object created with RedisCluster connection')
     except Exception as e:
