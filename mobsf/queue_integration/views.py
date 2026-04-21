@@ -26,16 +26,16 @@ from mobsf.queue_integration.aws_auth import (
 
 
 def _patch_bullmq_for_cluster() -> None:
-    """Patch bullmq's RedisConnection to accept redis.RedisCluster.
+    """Patch bullmq's RedisConnection to accept redis.asyncio.RedisCluster.
 
-    bullmq's RedisConnection only checks isinstance(opts, redis.Redis).
-    RedisCluster is not a Redis subclass, so we add explicit support.
-    We also add aclose() to RedisCluster since bullmq calls it during cleanup.
+    bullmq needs redis.asyncio.Redis so that Script.__call__ returns a coroutine
+    (execute_command is async def on the asyncio client). The sync RedisCluster
+    returns plain values which cannot be awaited.
+
+    RedisConnection only checks isinstance(opts, redis.Redis) — asyncio.RedisCluster
+    is not a subclass of either, so we add explicit support here.
     """
     from bullmq.redis_connection import RedisConnection
-    from redis.backoff import ExponentialBackoff
-    from redis.retry import Retry
-    from redis.exceptions import BusyLoadingError
 
     if getattr(RedisConnection, '_cluster_patched', False):
         return
@@ -43,7 +43,7 @@ def _patch_bullmq_for_cluster() -> None:
     _original_init = RedisConnection.__init__
 
     def _patched_init(self, redisOpts={}):
-        if isinstance(redisOpts, redis.RedisCluster):
+        if isinstance(redisOpts, redis.asyncio.RedisCluster):
             self.version = None
             self.conn = redisOpts
         else:
@@ -52,11 +52,7 @@ def _patch_bullmq_for_cluster() -> None:
     RedisConnection.__init__ = _patched_init
     RedisConnection._cluster_patched = True
 
-    # RedisCluster has close() but bullmq calls aclose() (async)
-    if not hasattr(redis.RedisCluster, 'aclose'):
-        async def _aclose(self):
-            self.close()
-        redis.RedisCluster.aclose = _aclose
+    # asyncio.RedisCluster has aclose() natively — no patch needed
 
 
 _patch_bullmq_for_cluster()
@@ -178,8 +174,8 @@ def _build_queue(queue_name: str) -> Queue:
     use_iam = should_use_iam_auth()
 
     if use_iam:
-        logger.debug('[REDIS_CONNECT] Creating RedisCluster connection (AWS MemoryDB cluster mode)')
-        connection = redis.RedisCluster(
+        logger.debug('[REDIS_CONNECT] Creating asyncio.RedisCluster connection (AWS MemoryDB cluster mode)')
+        connection = redis.asyncio.RedisCluster(
             host=opts['host'],
             port=opts['port'],
             password=opts.get('password'),
@@ -190,10 +186,10 @@ def _build_queue(queue_name: str) -> Queue:
             decode_responses=True,
             skip_full_coverage_check=True,  # MemoryDB doesn't expose full cluster info
         )
-        logger.debug('[REDIS_CONNECT_OK] RedisCluster connection created')
+        logger.debug('[REDIS_CONNECT_OK] asyncio.RedisCluster connection created')
     else:
         logger.debug('[REDIS_CONNECT] Creating Redis connection (local/dev mode)')
-        connection = opts  # bullmq creates redis.Redis from dict in non-cluster mode
+        connection = opts  # bullmq creates redis.asyncio.Redis from dict in non-cluster mode
 
     return Queue(queue_name, {'connection': connection})
 
