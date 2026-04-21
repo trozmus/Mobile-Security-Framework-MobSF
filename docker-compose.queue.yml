@@ -3,7 +3,7 @@ services:
   mobsf:
     build:
       context: .
-      dockerfile: Dockerfile.queue
+      dockerfile: Dockerfile
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -12,14 +12,35 @@ services:
     env_file:
       - .env
     environment:
-      - VALKEY_HOST=host.docker.internal
+      # AWS Configuration
+      - AWS_REGION=${AWS_REGION:-eu-central-1}
+      - NODE_ENV=${NODE_ENV:-local}
+      
+      # MemoryDB/Valkey Configuration
+      - VALKEY_HOST=${VALKEY_HOST:-host.docker.internal}
+      - VALKEY_PORT=${VALKEY_PORT:-6379}
+      - VALKEY_USERNAME=${VALKEY_USERNAME:-default}
+      - MEMORYDB_CLUSTER_NAME=${MEMORYDB_CLUSTER_NAME}
+      
+      # PostgreSQL Configuration
+      - POSTGRES_HOST=${POSTGRES_HOST:-host.docker.internal}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-mobsf}
+      
+      # For IAM auth: don't set POSTGRES_PASSWORD, let aws_auth.py generate token
+      # For local dev: set POSTGRES_PASSWORD if not using IAM
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      
+      # BullMQ queue names — must match QueueNames in NestJS (with {} for cluster slot)
+      - QUEUE_INPUT=${QUEUE_INPUT:-{app-scanner-requests}}
+      - QUEUE_OUTPUT=${QUEUE_OUTPUT:-{app-scanner-results}}
+      - QUEUE_ERRORS=${QUEUE_ERRORS:-{app-scanner-errors}}
+
+      # Other
       - MOBSF_API_KEY=${MOBSF_API_KEY}
-      # Map API_SCANNER_DB_* → POSTGRES_* which MobSF reads in settings.py
-      - POSTGRES_HOST=host.docker.internal
-      - POSTGRES_PORT=${API_SCANNER_DB_PORT:-5432}
-      - POSTGRES_USER=${API_SCANNER_DB_USERNAME:-postgres}
-      - POSTGRES_PASSWORD=${API_SCANNER_DB_PASSWORD:-postgres}
-      - POSTGRES_DB=${API_SCANNER_DB_DATABASE:-mudita_app_scanner}
+      - HOSTNAME=${HOSTNAME:-0.0.0.0}
+      - AWS_BUCKET_NAME_PRIVATE=${AWS_BUCKET_NAME_PRIVATE}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
