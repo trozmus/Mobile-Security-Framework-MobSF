@@ -26,15 +26,16 @@ from mobsf.queue_integration.aws_auth import (
 
 
 def _patch_bullmq_for_cluster() -> None:
-    """Patch bullmq's RedisConnection to accept redis.asyncio.RedisCluster.
+    """Patch bullmq for Redis Cluster compatibility.
 
-    bullmq needs redis.asyncio.Redis so that Script.__call__ returns a coroutine
-    (execute_command is async def on the asyncio client). The sync RedisCluster
-    returns plain values which cannot be awaited.
+    1. RedisConnection.__init__: accept redis.asyncio.RedisCluster directly
+       (bullmq only checks isinstance(opts, redis.Redis) which fails for cluster).
 
-    RedisConnection only checks isinstance(opts, redis.Redis) — asyncio.RedisCluster
-    is not a subclass of either, so we add explicit support here.
+    2. Worker.extendLocks: bullmq uses a pipeline to batch lock-renewal evalsha
+       calls, but Redis Cluster blocks pipelined evalsha across key slots.
+       Replace with sequential per-job calls.
     """
+    import logging as _logging
     from bullmq.redis_connection import RedisConnection
 
     if getattr(RedisConnection, '_cluster_patched', False):
@@ -52,7 +53,26 @@ def _patch_bullmq_for_cluster() -> None:
     RedisConnection.__init__ = _patched_init
     RedisConnection._cluster_patched = True
 
-    # asyncio.RedisCluster has aclose() natively — no patch needed
+    # Patch Worker.extendLocks to avoid pipelined evalsha (blocked in cluster mode)
+    try:
+        from bullmq.worker import Worker as _BullWorker
+        _patch_logger = _logging.getLogger(__name__)
+
+        async def _cluster_extend_locks(self, jobs):
+            for job in jobs:
+                try:
+                    await self.scripts.extendLock(
+                        job.id, self.token, self.opts.get('lockDuration'),
+                    )
+                except Exception as e:
+                    _patch_logger.warning(
+                        '[CLUSTER_PATCH] extendLock failed job=%s: %s', job.id, e,
+                    )
+
+        _BullWorker.extendLocks = _cluster_extend_locks
+    except Exception as e:
+        import logging as _l
+        _l.getLogger(__name__).warning('[CLUSTER_PATCH] Could not patch Worker.extendLocks: %s', e)
 
 
 _patch_bullmq_for_cluster()

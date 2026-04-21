@@ -66,11 +66,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _patch_bullmq_for_cluster() -> None:
-    """Patch bullmq's RedisConnection to accept redis.asyncio.RedisCluster.
+    """Patch bullmq for Redis Cluster compatibility.
 
-    bullmq internally does `import redis.asyncio as redis` and checks
-    isinstance(opts, redis.Redis). asyncio.RedisCluster is not a subclass,
-    so we add explicit handling here.
+    1. RedisConnection.__init__: accept redis.asyncio.RedisCluster directly
+       (bullmq only checks isinstance(opts, redis.Redis) which fails for cluster).
+
+    2. Worker.extendLocks: bullmq uses a pipeline to batch lock-renewal evalsha
+       calls, but Redis Cluster blocks pipelined evalsha across key slots.
+       Replace with sequential per-job calls.
     """
     from bullmq.redis_connection import RedisConnection
 
@@ -88,6 +91,25 @@ def _patch_bullmq_for_cluster() -> None:
 
     RedisConnection.__init__ = _patched_init
     RedisConnection._cluster_patched = True
+
+    # Patch Worker.extendLocks to avoid pipelined evalsha (blocked in cluster mode)
+    try:
+        from bullmq.worker import Worker as _BullWorker
+
+        async def _cluster_extend_locks(self, jobs):
+            for job in jobs:
+                try:
+                    await self.scripts.extendLock(
+                        job.id, self.token, self.opts.get('lockDuration'),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        '[CLUSTER_PATCH] extendLock failed job=%s: %s', job.id, e,
+                    )
+
+        _BullWorker.extendLocks = _cluster_extend_locks
+    except Exception as e:
+        logger.warning('[CLUSTER_PATCH] Could not patch Worker.extendLocks: %s', e)
 
 
 _patch_bullmq_for_cluster()
