@@ -7,12 +7,14 @@ OpenAPI JSON: /api/queue/openapi.json
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
 
 import redis
 from ninja import NinjaAPI, Schema
+from ninja.errors import ValidationError as NinjaValidationError
 from ninja.responses import codes_4xx, codes_5xx
 
 from bullmq import Queue
@@ -73,19 +75,39 @@ api = NinjaAPI(
 )
 
 
+def _log_request_body(request, label: str, extra: str = '') -> None:
+    try:
+        body = json.loads(request.body.decode('utf-8'))
+        logger.error('[%s] %s %s | body=%s%s', label, request.method, request.path, json.dumps(body), extra)
+    except Exception as parse_err:
+        logger.error('[%s] %s %s | body=<unparseable: %s>%s', label, request.method, request.path, parse_err, extra)
+
+
+@api.exception_handler(NinjaValidationError)
+def log_validation_error(request, exc: NinjaValidationError):
+    _log_request_body(request, 'VALIDATION_ERROR_422', f' | validation_errors={json.dumps(exc.errors)}')
+    raise exc
+
+
+@api.exception_handler(Exception)
+def log_unhandled(request, exc):
+    _log_request_body(request, 'REQUEST_EXCEPTION', f' | {type(exc).__name__}: {exc}')
+    raise exc
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
 
 class ScanJobRequest(Schema):
-    processId: str
-    processType: str
+    processID: str
+    processType: str = 'APP_REVIEW'
     url: str
 
     class Config:
         json_schema_extra = {
             'example': {
-                'processId': '123e4567-e89b-12d3-a456-426614174000',
+                'processID': '123e4567-e89b-12d3-a456-426614174000',
                 'processType': 'APP_REVIEW',
                 'url': 'https://example.com/app.apk',
             }
@@ -94,7 +116,7 @@ class ScanJobRequest(Schema):
 
 class ScanJobQueued(Schema):
     status: str
-    processId: str
+    processID: str
     queue: str
 
 
@@ -267,10 +289,10 @@ async def _push_to_queue(process_id: str, process_type: str, url: str, timeout: 
     tags=['Queue'],
 )
 def push_scan_job(request, payload: ScanJobRequest):
-    request_id = f"{payload.processId}-{int(time.time()*1000)}"
+    request_id = f"{payload.processID}-{int(time.time()*1000)}"
 
     logger.info(
-        f'[REQUEST_START] request_id={request_id} | processId={payload.processId} | processType={payload.processType} | url={payload.url}')
+        f'[REQUEST_START] request_id={request_id} | processId={payload.processID} | processType={payload.processType} | url={payload.url}')
     logger.debug(
         f'[REQUEST_DETAILS] method={request.method}, path={request.path}, client_ip={request.META.get("REMOTE_ADDR")}')
 
@@ -280,10 +302,10 @@ def push_scan_job(request, payload: ScanJobRequest):
     try:
         logger.debug(
             f'[ASYNCIO_RUN_START] request_id={request_id} | Starting async task...')
-        asyncio.run(_push_to_queue(payload.processId, payload.processType, payload.url))
+        asyncio.run(_push_to_queue(payload.processID, payload.processType, payload.url))
         elapsed = time.time() - start_time
         logger.info(
-            f'[REQUEST_SUCCESS] request_id={request_id} | Completed in {elapsed:.2f}s | processId={payload.processId}')
+            f'[REQUEST_SUCCESS] request_id={request_id} | Completed in {elapsed:.2f}s | processId={payload.processID}')
 
     except TimeoutError as exc:
         elapsed = time.time() - start_time
@@ -305,7 +327,7 @@ def push_scan_job(request, payload: ScanJobRequest):
 
     return 200, ScanJobQueued(
         status='queued',
-        processId=payload.processId,
+        processID=payload.processID,
         queue=queue_name,
     )
 
