@@ -312,6 +312,13 @@ def _run_static_scan(filename: str, apk_bytes: bytes) -> tuple[str, dict]:
     }
     initialize_app_dic(app_dic, 'apk')
 
+    # Cache hit — skip full scan if result already in DB
+    db_entry = StaticAnalyzerAndroid.objects.filter(MD5=checksum)
+    if db_entry.exists():
+        logger.info('[SCAN_CACHE_HIT] md5=%s already in DB, skipping scan', checksum)
+        report = get_context_from_db_entry(db_entry)
+        return checksum, report
+
     logger.info('[SCAN] Starting static analysis: file=%s md5=%s', filename, checksum)
     context, err = apk_analysis_task(checksum, app_dic, rescan=False)
     if err:
@@ -531,7 +538,7 @@ async def _run_worker():
         logger.info('[WORKER_READY] Watching Redis keys: bull:%s:wait / :active / :delayed', input_queue)
 
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(15)
             logger.debug('[WORKER_HEARTBEAT] alive queue=%s', input_queue)
 
     except (AuthenticationError, RedisConnectionError) as e:
