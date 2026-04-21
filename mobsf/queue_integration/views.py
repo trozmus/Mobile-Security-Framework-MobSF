@@ -182,9 +182,10 @@ def _build_queue(queue_name: str) -> Queue:
             username=opts.get('username'),
             ssl=True,
             ssl_cert_reqs=None,
+            ssl_check_hostname=False,
             socket_timeout=10,
             decode_responses=True,
-            skip_full_coverage_check=True,  # MemoryDB doesn't expose full cluster info
+            require_full_coverage=False,  # MemoryDB doesn't expose full cluster info
         )
         logger.debug('[REDIS_CONNECT_OK] asyncio.RedisCluster connection created')
     else:
