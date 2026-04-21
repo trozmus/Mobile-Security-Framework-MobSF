@@ -7,8 +7,8 @@ import os
 import platform
 import shutil
 import subprocess
-import threading
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import gettempdir
 
@@ -41,31 +41,27 @@ def dex_2_smali(checksum, app_dir, tools_dir):
         logger.info(msg)
         append_scan_status(checksum, msg)
         dexes = get_dex_files(app_dir)
-        for dex_path in dexes:
+        if (len(settings.BACKSMALI_BINARY) > 0
+                and is_file_exists(settings.BACKSMALI_BINARY)):
+            bs_path = settings.BACKSMALI_BINARY
+        else:
+            bs_path = os.path.join(tools_dir, 'baksmali-3.0.8-dev-fat.jar')
+        output = os.path.join(app_dir, 'smali_source/')
+        java_bin = find_java_binary()
+
+        # Limit concurrent baksmali processes to avoid saturating CPU on large APKs
+        max_workers = max(1, os.cpu_count() or 2)
+
+        def _run_baksmali(dex_path):
             try:
-                logger.info('Converting %s to Smali Code',
-                            filename_from_path(dex_path))
-                if (len(settings.BACKSMALI_BINARY) > 0
-                        and is_file_exists(settings.BACKSMALI_BINARY)):
-                    bs_path = settings.BACKSMALI_BINARY
-                else:
-                    bs_path = os.path.join(tools_dir, 'baksmali-3.0.8-dev-fat.jar')
-                output = os.path.join(app_dir, 'smali_source/')
-                smali = [
-                    find_java_binary(),
-                    '-jar',
-                    bs_path,
-                    'd',
-                    dex_path,
-                    '-o',
-                    output,
-                ]
-                trd = threading.Thread(target=subprocess.call, args=(smali,))
-                trd.daemon = True
-                trd.start()
+                logger.info('Converting %s to Smali Code', filename_from_path(dex_path))
+                subprocess.call([java_bin, '-jar', bs_path, 'd', dex_path, '-o', output])
             except Exception:
                 # Fixes a bug #2014
                 pass
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(_run_baksmali, dexes))
     except Exception as exp:
         msg = 'Failed to convert DEX to Smali'
         logger.exception(msg)
