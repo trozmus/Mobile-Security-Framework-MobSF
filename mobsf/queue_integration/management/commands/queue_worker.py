@@ -118,22 +118,26 @@ def _build_connection():
     In cluster mode (NODE_ENV=dev/prod) bullmq needs an async Redis client
     so that Script.__call__ returns a coroutine — sync RedisCluster would
     cause 'object str can't be used in await expression'.
+
+    NOTE: Worker passes this to RedisConnection twice (redisConnection +
+    blockingRedisConnection), so both share the same cluster object.
     """
     host = os.getenv('VALKEY_HOST', 'localhost')
     port = int(os.getenv('VALKEY_PORT', '6379'))
     username = os.getenv('VALKEY_USERNAME', 'default')
     use_iam = should_use_iam_auth()
 
-    logger.debug(
-        '[WORKER_CONN] host=%s:%s, username=%s, mode=%s',
-        host, port, username, 'IAM_TOKEN' if use_iam else 'STATIC_PASSWORD',
+    logger.info(
+        '[CONN_BUILD] host=%s:%s username=%s ssl=%s mode=%s',
+        host, port, username, use_iam, 'IAM_TOKEN' if use_iam else 'STATIC_PASSWORD',
     )
 
+    logger.info('[CONN_BUILD] Fetching auth credential...')
     password = get_memorydb_auth_token()
-    logger.info('[WORKER_CONN] Credential obtained')
+    logger.info('[CONN_BUILD] Credential obtained (length=%d chars)', len(password) if password else 0)
 
     if use_iam:
-        logger.debug('[WORKER_CONN] Creating asyncio.RedisCluster (cluster mode)')
+        logger.info('[CONN_BUILD] Creating redis.asyncio.RedisCluster...')
         conn = redis.asyncio.RedisCluster(
             host=host,
             port=port,
@@ -146,16 +150,93 @@ def _build_connection():
             decode_responses=True,
             require_full_coverage=False,
         )
-        logger.debug('[WORKER_CONN] asyncio.RedisCluster created')
+        logger.info('[CONN_BUILD] redis.asyncio.RedisCluster object created (lazy — connects on first command)')
         return conn
     else:
-        logger.debug('[WORKER_CONN] Using dict opts (local Redis)')
+        logger.info('[CONN_BUILD] Using dict opts (local Redis, bullmq will create asyncio.Redis)')
         return {
             'host': host,
             'port': port,
             'username': username,
             'password': password,
         }
+
+
+async def _ping_connection(conn) -> bool:
+    """Send PING to verify the connection is reachable. Logs result."""
+    try:
+        if isinstance(conn, redis.asyncio.RedisCluster):
+            result = await conn.ping()
+        elif isinstance(conn, dict):
+            test = redis.asyncio.Redis(**conn, decode_responses=True)
+            result = await test.ping()
+            await test.aclose()
+        else:
+            result = await conn.ping()
+        logger.info('[CONN_PING] PING → %s', result)
+        return True
+    except Exception as e:
+        logger.error('[CONN_PING] PING failed: %s: %s', type(e).__name__, e)
+        return False
+
+
+async def _diagnose_queue(conn, queue_name: str) -> None:
+    """Inspect actual Redis keys for the queue and log their state.
+
+    Helps diagnose why jobs are not being picked up:
+    - shows how many jobs are in each list/set
+    - verifies the key prefix matches what the worker listens on
+    - checks whether the marker key (used by bzpopmin) exists
+    """
+    prefix = 'bull'
+    base = f'{prefix}:{queue_name}'
+    keys_to_check = {
+        'wait':     f'{base}:wait',
+        'active':   f'{base}:active',
+        'delayed':  f'{base}:delayed',
+        'failed':   f'{base}:failed',
+        'completed':f'{base}:completed',
+        'marker':   f'{base}:marker',
+        'id':       f'{base}:id',
+        'meta':     f'{base}:meta',
+    }
+
+    logger.info('[QUEUE_DIAG] Inspecting queue: %s', queue_name)
+    logger.info('[QUEUE_DIAG] Expected Redis key prefix: "%s"', base)
+
+    try:
+        for name, key in keys_to_check.items():
+            try:
+                key_type = await conn.type(key)
+                if key_type == 'none':
+                    logger.info('[QUEUE_DIAG]   %-12s %-50s → does not exist', name, key)
+                elif key_type == 'list':
+                    count = await conn.llen(key)
+                    logger.info('[QUEUE_DIAG]   %-12s %-50s → list, %d items', name, key, count)
+                elif key_type == 'zset':
+                    count = await conn.zcard(key)
+                    logger.info('[QUEUE_DIAG]   %-12s %-50s → zset, %d items', name, key, count)
+                elif key_type == 'string':
+                    val = await conn.get(key)
+                    logger.info('[QUEUE_DIAG]   %-12s %-50s → string, value=%r', name, key, val)
+                else:
+                    logger.info('[QUEUE_DIAG]   %-12s %-50s → %s', name, key, key_type)
+            except Exception as e:
+                logger.warning('[QUEUE_DIAG]   %-12s %-50s → ERROR: %s', name, key, e)
+
+        # Show first 3 job IDs from wait list to confirm format
+        wait_key = keys_to_check['wait']
+        try:
+            job_ids = await conn.lrange(wait_key, 0, 2)
+            if job_ids:
+                logger.info('[QUEUE_DIAG] First job IDs in wait: %s', job_ids)
+            else:
+                logger.info('[QUEUE_DIAG] wait list is empty — no jobs waiting')
+        except Exception as e:
+            logger.warning('[QUEUE_DIAG] Could not read wait list: %s', e)
+
+    except Exception as e:
+        logger.error('[QUEUE_DIAG] Diagnostics failed: %s: %s', type(e).__name__, e)
 
 
 def _build_queue(queue_name: str) -> Queue:
@@ -283,10 +364,15 @@ async def _process_job(job, token):
         processType (str) – process type (e.g. APP_REVIEW)
         url        (str) – publicly accessible URL to the APK file
     """
-    logger.info(
-        '[JOB_RECEIVED] id=%s name=%s data=%r',
-        job.id, job.name, job.data,
-    )
+    import time
+    job_start = time.time()
+
+    logger.info('─' * 50)
+    logger.info('[JOB_DEQUEUED] id=%s name=%s attempts=%s timestamp=%s',
+                job.id, job.name,
+                job.opts.get('attempts', '?'),
+                job.timestamp)
+    logger.info('[JOB_DATA] id=%s data=%r', job.id, job.data)
 
     if job.name != 'app-binary-scan-requested':
         logger.warning(
@@ -296,6 +382,7 @@ async def _process_job(job, token):
         return
 
     job_data = job.data.get('jobData', job.data)
+    logger.debug('[JOB_PARSED] id=%s job_data keys=%s', job.id, list(job_data.keys()))
 
     if 'report' in job_data or ('status' in job_data and job_data['status'] in ('success', 'error')):
         logger.warning(
@@ -308,28 +395,30 @@ async def _process_job(job, token):
     # Accept both processId (NestJS convention) and processID (legacy)
     process_id = job_data.get('processId') or job_data.get('processID')
     url = job_data.get('url')
-
-    logger.info(
-        '[JOB_START] id=%s processId=%s processType=%s url=%s',
-        job.id, process_id, job_data.get('processType'), url,
-    )
+    process_type = job_data.get('processType', '?')
 
     if not process_id or not url:
         logger.error(
-            '[JOB_INVALID] id=%s missing required fields: processId=%r url=%r — '
-            'full data: %r',
+            '[JOB_INVALID] id=%s missing required fields: processId=%r url=%r — full data: %r',
             job.id, process_id, url, job_data,
         )
         return
 
+    logger.info('[JOB_START] id=%s processId=%s processType=%s url=%s',
+                job.id, process_id, process_type, url)
+
     loop = asyncio.get_event_loop()
 
     # --- Download ---
+    t0 = time.time()
+    logger.info('[JOB_DOWNLOAD] id=%s Starting download from %s', job.id, url)
     try:
         apk_bytes, filename = await loop.run_in_executor(None, _download_apk, url)
+        logger.info('[JOB_DOWNLOAD_OK] id=%s file=%s size=%d bytes elapsed=%.2fs',
+                    job.id, filename, len(apk_bytes), time.time() - t0)
     except Exception as exc:
-        logger.error('[JOB_DOWNLOAD_FAIL] id=%s processId=%s url=%s: %s',
-                     job.id, process_id, url, exc)
+        logger.error('[JOB_DOWNLOAD_FAIL] id=%s processId=%s url=%s elapsed=%.2fs error=%s: %s',
+                     job.id, process_id, url, time.time() - t0, type(exc).__name__, exc)
         await _publish({
             'processId': process_id,
             'status': 'error',
@@ -339,11 +428,15 @@ async def _process_job(job, token):
         return
 
     # --- Scan ---
+    t0 = time.time()
+    logger.info('[JOB_SCAN] id=%s Starting static analysis: file=%s size=%d bytes',
+                job.id, filename, len(apk_bytes))
     try:
         _, report = await loop.run_in_executor(None, _run_static_scan, filename, apk_bytes)
+        logger.info('[JOB_SCAN_OK] id=%s file=%s elapsed=%.2fs', job.id, filename, time.time() - t0)
     except Exception as exc:
-        logger.error('[JOB_SCAN_FAIL] id=%s processId=%s file=%s: %s',
-                     job.id, process_id, filename, exc)
+        logger.error('[JOB_SCAN_FAIL] id=%s processId=%s file=%s elapsed=%.2fs error=%s: %s',
+                     job.id, process_id, filename, time.time() - t0, type(exc).__name__, exc)
         await _publish({
             'processId': process_id,
             'status': 'error',
@@ -354,7 +447,10 @@ async def _process_job(job, token):
         return
 
     # --- Success ---
-    logger.info('[JOB_DONE] id=%s processId=%s file=%s', job.id, process_id, filename)
+    total = time.time() - job_start
+    logger.info('[JOB_DONE] id=%s processId=%s file=%s total_elapsed=%.2fs',
+                job.id, process_id, filename, total)
+    logger.info('─' * 50)
     await _publish({
         'processId': process_id,
         'status': 'success',
@@ -396,15 +492,25 @@ async def _run_worker():
 
     worker = None
     try:
-        logger.info('[WORKER_CONNECT] Obtaining credentials...')
+        logger.info('[WORKER_CONNECT] Step 1/3: Building Redis connection...')
         conn = _build_connection()
-        logger.info('[WORKER_CONNECT] Creating BullMQ Worker on queue=%s', input_queue)
+
+        logger.info('[WORKER_CONNECT] Step 2/3: Testing connection with PING...')
+        ping_ok = await _ping_connection(conn)
+        if not ping_ok:
+            logger.error('[WORKER_CONNECT] PING failed — Redis unreachable, aborting start')
+            return True
+
+        await _diagnose_queue(conn, input_queue)
+
+        logger.info('[WORKER_CONNECT] Step 3/3: Creating BullMQ Worker on queue=%s', input_queue)
         worker = Worker(input_queue, _process_job, {'connection': conn})
-        logger.info('[WORKER_READY] Worker is listening. Waiting for jobs...')
+        logger.info('[WORKER_READY] ✓ Worker is live and listening for jobs on queue=%s', input_queue)
+        logger.info('[WORKER_READY] Watching Redis keys: bull:%s:wait / :active / :delayed', input_queue)
 
         while True:
             await asyncio.sleep(5)
-            logger.debug('[WORKER_HEARTBEAT] alive, queue=%s', input_queue)
+            logger.debug('[WORKER_HEARTBEAT] alive queue=%s', input_queue)
 
     except (AuthenticationError, RedisConnectionError) as e:
         logger.warning('[WORKER_AUTH_ERROR] %s — will restart with fresh credentials', e)
