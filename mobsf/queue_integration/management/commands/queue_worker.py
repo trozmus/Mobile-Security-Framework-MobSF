@@ -314,10 +314,13 @@ def _run_static_scan(filename: str, apk_bytes: bytes) -> tuple[str, dict]:
 
     # Cache hit — skip full scan if result already in DB
     db_entry = StaticAnalyzerAndroid.objects.filter(MD5=checksum)
-    if db_entry.exists():
+    db_count = db_entry.count()
+    logger.info('[SCAN_CACHE_CHECK] md5=%s db_count=%d', checksum, db_count)
+    if db_count > 0:
         logger.info('[SCAN_CACHE_HIT] md5=%s already in DB, skipping scan', checksum)
         report = get_context_from_db_entry(db_entry)
         return checksum, report
+    logger.info('[SCAN_CACHE_MISS] md5=%s not in DB, running full scan', checksum)
 
     logger.info('[SCAN] Starting static analysis: file=%s md5=%s', filename, checksum)
     context, err = apk_analysis_task(checksum, app_dic, rescan=False)
