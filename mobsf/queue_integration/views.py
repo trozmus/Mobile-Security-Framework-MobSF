@@ -13,6 +13,10 @@ import time
 
 import redis
 import redis.asyncio
+try:
+    from redis.asyncio.cluster import RedisCluster
+except ImportError:
+    from redis.cluster import RedisCluster
 from ninja import NinjaAPI, Schema
 from ninja.responses import codes_4xx, codes_5xx
 
@@ -180,29 +184,40 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
     logger.debug(
         f'[REDIS_CONNECT] Attempting connection to {redis_opts["host"]}:{redis_opts["port"]}...')
     try:
-        # For MemoryDB in cluster mode, use simple Redis URL without cluster params
-        # redis-py won't auto-detect cluster mode on simple URL, bullmq handles it fine
+        # For MemoryDB in cluster mode, use RedisCluster with proper configuration
+        # Wrap queue name in curly braces {} for cluster mode (hash slot mapping)
         host = redis_opts['host']
         port = redis_opts['port']
         username = redis_opts.get('username', 'default')
         password = redis_opts['password']
+        use_ssl = redis_opts.get('ssl', False)
+        ssl_cert_reqs = redis_opts.get('ssl_cert_reqs', None)
 
         logger.debug(
-            f'[REDIS_CONNECT] Creating async Redis connection (simple URL)')
+            f'[REDIS_CONNECT] Creating RedisCluster connection (AWS MemoryDB cluster mode)')
 
-        # Build URL without cluster-specific params
-        from urllib.parse import quote
-        encoded_password = quote(password, safe='')
+        # Create RedisCluster connection with skip_full_coverage_check for single-shard cluster
+        redis_client = RedisCluster(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            ssl=use_ssl,
+            ssl_cert_reqs=ssl_cert_reqs,
+            skip_full_coverage_check=True,  # AWS recommends this for single-shard cluster
+            decode_responses=False,  # BullMQ works with binary (msgpack)
+        )
+        logger.debug(f'[REDIS_CONNECT_OK] RedisCluster connection created')
 
-        # Use rediss:// for SSL connection
-        redis_url = f'rediss://{username}:{encoded_password}@{host}:{port}/0'
+        # Wrap queue name in curly braces {} for hash slot consistency in cluster mode
+        queue_name_cluster = f'{{{queue_name}}}'
         logger.debug(
-            f'[REDIS_CONNECT] Built connection URL: rediss://{username}:***@{host}:{port}/0')
+            f'[REDIS_CONNECT] Using cluster-mode queue name: {queue_name_cluster}')
 
-        # Create Queue with URL - redis-py will use simple client without cluster detection
-        q = Queue(queue_name, {'connection': redis_url})
+        # Create Queue with RedisCluster connection
+        q = Queue(queue_name_cluster, connection=redis_client)
         logger.debug(
-            f'[REDIS_CONNECT_OK] Queue object created with simple Redis connection')
+            f'[REDIS_CONNECT_OK] Queue object created with RedisCluster connection')
     except Exception as e:
         logger.error(
             f'[REDIS_CONNECT_ERROR] Failed to create Queue object: {type(e).__name__}: {e}')
