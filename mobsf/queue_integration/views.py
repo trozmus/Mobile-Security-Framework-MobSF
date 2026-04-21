@@ -78,13 +78,15 @@ api = NinjaAPI(
 # ---------------------------------------------------------------------------
 
 class ScanJobRequest(Schema):
-    processID: str
+    processId: str
+    processType: str
     url: str
 
     class Config:
         json_schema_extra = {
             'example': {
-                'processID': 'my-process-001',
+                'processId': '123e4567-e89b-12d3-a456-426614174000',
+                'processType': 'APP_REVIEW',
                 'url': 'https://example.com/app.apk',
             }
         }
@@ -92,7 +94,7 @@ class ScanJobRequest(Schema):
 
 class ScanJobQueued(Schema):
     status: str
-    processID: str
+    processId: str
     queue: str
 
 
@@ -175,17 +177,31 @@ def _build_queue(queue_name: str) -> Queue:
 
 
 def _get_input_queue() -> str:
-    return os.getenv('QUEUE_INPUT', 'APP-SCANN')
+    # Must match QueueNames.APP_SCANNER_REQUESTS in NestJS (with {} for cluster slot)
+    return os.getenv('QUEUE_INPUT', '{app-scanner-requests}')
 
 
 def _get_output_queue() -> str:
-    return os.getenv('QUEUE_OUTPUT', 'APP-SCANN-RESULT')
+    # Must match QueueNames.APP_SCANNER_RESULTS in NestJS (with {} for cluster slot)
+    return os.getenv('QUEUE_OUTPUT', '{app-scanner-results}')
 
 
-async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
-    queue_name = _get_input_queue()
+def _ensure_cluster_safe_name(queue_name: str) -> str:
+    """Warn if a queue name lacks {} hash tag required for Redis Cluster slot routing."""
+    if should_use_iam_auth() and not ('{' in queue_name and '}' in queue_name):
+        logger.warning(
+            f'[QUEUE_NAME_WARNING] Queue name "{queue_name}" has no {{}} hash tag. '
+            'In Redis Cluster mode all BullMQ keys for a queue must map to the same slot. '
+            'Wrap the name in braces, e.g. "{%s}". See: https://docs.bullmq.io/guide/redis-tm-hosting/aws-memorydb',
+            queue_name,
+        )
+    return queue_name
+
+
+async def _push_to_queue(process_id: str, process_type: str, url: str, timeout: int = 30) -> None:
+    queue_name = _ensure_cluster_safe_name(_get_input_queue())
     logger.debug(
-        f'[ASYNC_PUSH_START] processID={process_id}, queue={queue_name}, url={url}, timeout={timeout}s')
+        f'[ASYNC_PUSH_START] processId={process_id}, processType={process_type}, queue={queue_name}, url={url}, timeout={timeout}s')
 
     start_time = time.time()
 
@@ -202,8 +218,11 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
         # Add timeout protection for queue.add operation
         try:
             job = await asyncio.wait_for(
-                q.add('app-binary-scan-requested',
-                      {'processID': process_id, 'url': url}),
+                q.add('app-binary-scan-requested', {
+                    'processId': process_id,
+                    'processType': process_type,
+                    'url': url,
+                }),
                 timeout=timeout
             )
             elapsed = time.time() - start_time
@@ -241,17 +260,17 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
     response={200: ScanJobQueued, codes_4xx: ErrorResponse, codes_5xx: ErrorResponse},
     summary='Push a scan job to the input queue',
     description=(
-        'Publishes a new scan job to the BullMQ input queue (`APP-SCANN` by default). '
+        'Publishes a new scan job to the BullMQ input queue (`{app-scanner-requests}` by default). '
         'The queue worker will download the APK from `url`, run a static analysis '
-        'and publish the result to the output queue (`APP-SCANN-RESULT` by default).'
+        'and publish the result to the output queue (`{app-scanner-results}` by default).'
     ),
     tags=['Queue'],
 )
 def push_scan_job(request, payload: ScanJobRequest):
-    request_id = f"{payload.processID}-{int(time.time()*1000)}"
+    request_id = f"{payload.processId}-{int(time.time()*1000)}"
 
     logger.info(
-        f'[REQUEST_START] request_id={request_id} | processID={payload.processID} | url={payload.url}')
+        f'[REQUEST_START] request_id={request_id} | processId={payload.processId} | processType={payload.processType} | url={payload.url}')
     logger.debug(
         f'[REQUEST_DETAILS] method={request.method}, path={request.path}, client_ip={request.META.get("REMOTE_ADDR")}')
 
@@ -261,10 +280,10 @@ def push_scan_job(request, payload: ScanJobRequest):
     try:
         logger.debug(
             f'[ASYNCIO_RUN_START] request_id={request_id} | Starting async task...')
-        asyncio.run(_push_to_queue(payload.processID, payload.url))
+        asyncio.run(_push_to_queue(payload.processId, payload.processType, payload.url))
         elapsed = time.time() - start_time
         logger.info(
-            f'[REQUEST_SUCCESS] request_id={request_id} | Completed in {elapsed:.2f}s | processID={payload.processID}')
+            f'[REQUEST_SUCCESS] request_id={request_id} | Completed in {elapsed:.2f}s | processId={payload.processId}')
 
     except TimeoutError as exc:
         elapsed = time.time() - start_time
@@ -286,7 +305,7 @@ def push_scan_job(request, payload: ScanJobRequest):
 
     return 200, ScanJobQueued(
         status='queued',
-        processID=payload.processID,
+        processId=payload.processId,
         queue=queue_name,
     )
 
