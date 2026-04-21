@@ -27,6 +27,7 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
+import boto3
 import redis
 import redis.asyncio
 import requests
@@ -49,7 +50,7 @@ except ImportError:
         pass
 
 from mobsf.MobSF.views.scanning import add_to_recent_scan, handle_uploaded_file
-from mobsf.StaticAnalyzer.models import StaticAnalyzerAndroid
+from mobsf.StaticAnalyzer.models import RecentScansDB, StaticAnalyzerAndroid
 from mobsf.StaticAnalyzer.views.android.apk import (
     apk_analysis_task,
     initialize_app_dic,
@@ -57,6 +58,8 @@ from mobsf.StaticAnalyzer.views.android.apk import (
 from mobsf.StaticAnalyzer.views.android.db_interaction import (
     get_context_from_db_entry,
 )
+from mobsf.StaticAnalyzer.views.common.appsec import get_android_dashboard
+from mobsf.StaticAnalyzer.views.common.shared_func import get_avg_cvss
 
 logger = logging.getLogger(__name__)
 
@@ -272,22 +275,170 @@ def _build_queue(queue_name: str) -> Queue:
 # APK helpers
 # ---------------------------------------------------------------------------
 
-def _filename_from_url(url: str) -> str:
-    path = urlparse(url).path
+def _filename_from_path(path: str) -> str:
     name = os.path.basename(path)
     return name if name.lower().endswith('.apk') else 'app.apk'
 
 
+def _parse_s3_url(url: str) -> tuple[str, str] | None:
+    """Return (bucket, key) for s3:// or https://*.s3.*.amazonaws.com/* URLs, else None."""
+    parsed = urlparse(url)
+    if parsed.scheme == 's3':
+        bucket, key = parsed.netloc, parsed.path.lstrip('/')
+        logger.debug('[S3_URL_PARSE] scheme=s3 bucket=%s key=%s', bucket, key)
+        return bucket, key
+    if parsed.scheme in ('https', 'http') and parsed.hostname and '.s3.' in parsed.hostname:
+        bucket = parsed.hostname.split('.s3.')[0]
+        key = parsed.path.lstrip('/')
+        logger.debug('[S3_URL_PARSE] scheme=https bucket=%s key=%s', bucket, key)
+        return bucket, key
+    logger.debug('[S3_URL_PARSE] url=%s is not an S3 URL, using HTTP download', url)
+    return None
+
+
+def _download_apk_s3(bucket: str, key: str) -> tuple[bytes, str]:
+    import time
+    region = os.getenv('AWS_REGION', 'eu-central-1')
+    logger.info('[DOWNLOAD_S3] Starting: bucket=%s key=%s region=%s', bucket, key, region)
+    t0 = time.time()
+    try:
+        s3 = boto3.client('s3', region_name=region)
+        logger.debug('[DOWNLOAD_S3] boto3 client created, calling download_fileobj...')
+        buf = io.BytesIO()
+        s3.download_fileobj(bucket, key, buf)
+        content = buf.getvalue()
+        if not content:
+            raise ValueError(f'Downloaded file is empty: s3://{bucket}/{key}')
+        filename = _filename_from_path(key)
+        logger.info('[DOWNLOAD_S3_OK] bucket=%s key=%s size=%d bytes filename=%s elapsed=%.2fs',
+                    bucket, key, len(content), filename, time.time() - t0)
+        return content, filename
+    except Exception as e:
+        logger.error('[DOWNLOAD_S3_FAIL] bucket=%s key=%s elapsed=%.2fs error=%s: %s',
+                     bucket, key, time.time() - t0, type(e).__name__, e)
+        raise
+
+
 def _download_apk(url: str) -> tuple[bytes, str]:
-    logger.info('[DOWNLOAD] Downloading APK from %s', url)
-    resp = requests.get(url, timeout=120, stream=True)
-    resp.raise_for_status()
-    content = b''.join(resp.iter_content(chunk_size=65536))
-    if not content:
-        raise ValueError(f'Downloaded file is empty: {url}')
-    filename = _filename_from_url(url)
-    logger.info('[DOWNLOAD] Downloaded %d bytes as %s', len(content), filename)
-    return content, filename
+    import time
+    logger.info('[DOWNLOAD] url=%s', url)
+    s3_loc = _parse_s3_url(url)
+    if s3_loc:
+        return _download_apk_s3(*s3_loc)
+    t0 = time.time()
+    logger.info('[DOWNLOAD_HTTP] Starting HTTP download: url=%s', url)
+    try:
+        resp = requests.get(url, timeout=120, stream=True)
+        logger.debug('[DOWNLOAD_HTTP] HTTP %d for url=%s', resp.status_code, url)
+        resp.raise_for_status()
+        content = b''.join(resp.iter_content(chunk_size=65536))
+        if not content:
+            raise ValueError(f'Downloaded file is empty: {url}')
+        filename = _filename_from_path(urlparse(url).path)
+        logger.info('[DOWNLOAD_HTTP_OK] url=%s size=%d bytes filename=%s elapsed=%.2fs',
+                    url, len(content), filename, time.time() - t0)
+        return content, filename
+    except Exception as e:
+        logger.error('[DOWNLOAD_HTTP_FAIL] url=%s elapsed=%.2fs error=%s: %s',
+                     url, time.time() - t0, type(e).__name__, e)
+        raise
+
+
+def _generate_pdf(checksum: str) -> bytes | None:
+    """Generate PDF report for a completed scan. Returns PDF bytes or None on failure."""
+    try:
+        import pdfkit
+        import platform
+        from django.template.loader import get_template
+        from mobsf.MobSF.utils import upstream_proxy
+
+        static_db = StaticAnalyzerAndroid.objects.filter(MD5=checksum)
+        if not static_db.exists():
+            logger.error('[PDF_GEN] No DB entry for md5=%s', checksum)
+            return None
+
+        logger.info('[PDF_GEN] Building context for md5=%s', checksum)
+        context = get_context_from_db_entry(static_db)
+        context['average_cvss'] = get_avg_cvss(context['code_analysis'])
+        context['appsec'] = get_android_dashboard(static_db)
+        context['virus_total'] = None
+
+        proto = 'file:///' if platform.system() == 'Windows' else 'file://'
+        host_os = 'windows' if platform.system() == 'Windows' else 'nix'
+        context['base_url'] = proto + settings.BASE_DIR
+        context['dwd_dir'] = proto + settings.DWD_DIR
+        context['host_os'] = host_os
+
+        try:
+            context['timestamp'] = RecentScansDB.objects.get(MD5=checksum).TIMESTAMP
+        except RecentScansDB.DoesNotExist:
+            context['timestamp'] = None
+
+        options = {
+            'page-size': 'Letter',
+            'quiet': '',
+            'enable-local-file-access': '',
+            'no-collate': '',
+            'margin-top': '0.50in',
+            'margin-right': '0.50in',
+            'margin-bottom': '0.50in',
+            'margin-left': '0.50in',
+            'encoding': 'UTF-8',
+            'orientation': 'Landscape',
+            'custom-header': [('Accept-Encoding', 'gzip')],
+            'no-outline': None,
+        }
+        proxies, _ = upstream_proxy('https')
+        if proxies.get('https'):
+            options['proxy'] = proxies['https']
+
+        template = get_template('pdf/android_report.html')
+        html = template.render(context)
+        logger.info('[PDF_GEN] Rendering PDF for md5=%s', checksum)
+        pdf_bytes = pdfkit.from_string(html, False, options=options)
+        logger.info('[PDF_GEN_OK] md5=%s size=%d bytes', checksum, len(pdf_bytes))
+        return pdf_bytes
+    except ImportError:
+        logger.warning('[PDF_GEN] pdfkit/wkhtmltopdf not available — skipping PDF generation')
+        return None
+    except Exception as e:
+        logger.error('[PDF_GEN_FAIL] md5=%s error=%s: %s', checksum, type(e).__name__, e)
+        return None
+
+
+def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str, checksum: str) -> str | None:
+    """Upload PDF bytes to S3 in the same directory as the source APK.
+
+    Returns the S3 URI of the uploaded PDF or None on failure.
+    """
+    s3_loc = _parse_s3_url(source_url)
+    if not s3_loc:
+        logger.info('[PDF_UPLOAD] Source URL is not S3 — skipping PDF upload')
+        return None
+
+    bucket, apk_key = s3_loc
+    apk_dir = os.path.dirname(apk_key)
+    apk_basename = os.path.splitext(os.path.basename(apk_key))[0]
+    pdf_filename = f'{apk_basename}.pdf'
+    pdf_key = f'{apk_dir}/{pdf_filename}' if apk_dir else pdf_filename
+    region = os.getenv('AWS_REGION', 'eu-central-1')
+
+    logger.info('[PDF_UPLOAD] Uploading PDF to s3://%s/%s', bucket, pdf_key)
+    try:
+        s3 = boto3.client('s3', region_name=region)
+        s3.put_object(
+            Bucket=bucket,
+            Key=pdf_key,
+            Body=pdf_bytes,
+            ContentType='application/pdf',
+        )
+        s3_uri = f's3://{bucket}/{pdf_key}'
+        logger.info('[PDF_UPLOAD_OK] Uploaded PDF to %s size=%d bytes', s3_uri, len(pdf_bytes))
+        return s3_uri
+    except Exception as e:
+        logger.error('[PDF_UPLOAD_FAIL] bucket=%s key=%s error=%s: %s',
+                     bucket, pdf_key, type(e).__name__, e)
+        return None
 
 
 def _run_static_scan(filename: str, apk_bytes: bytes) -> tuple[str, dict]:
@@ -464,7 +615,7 @@ async def _process_job(job, token):
     logger.info('[JOB_SCAN] id=%s Starting static analysis: file=%s size=%d bytes',
                 job.id, filename, len(apk_bytes))
     try:
-        _, report = await loop.run_in_executor(None, _run_static_scan, filename, apk_bytes)
+        checksum, report = await loop.run_in_executor(None, _run_static_scan, filename, apk_bytes)
         logger.info('[JOB_SCAN_OK] id=%s file=%s elapsed=%.2fs', job.id, filename, time.time() - t0)
     except Exception as exc:
         logger.error('[JOB_SCAN_FAIL] id=%s processId=%s file=%s elapsed=%.2fs error=%s: %s',
@@ -478,16 +629,28 @@ async def _process_job(job, token):
         })
         return
 
+    # --- Generate and upload PDF ---
+    pdf_s3_uri = None
+    t0 = time.time()
+    logger.info('[JOB_PDF] id=%s Generating PDF report...', job.id)
+    pdf_bytes = await loop.run_in_executor(None, _generate_pdf, checksum)
+    if pdf_bytes:
+        logger.info('[JOB_PDF] id=%s PDF generated in %.2fs, uploading to S3...', job.id, time.time() - t0)
+        pdf_s3_uri = await loop.run_in_executor(None, _upload_pdf_to_s3, pdf_bytes, url, checksum)
+    else:
+        logger.warning('[JOB_PDF] id=%s PDF generation failed or skipped', job.id)
+
     # --- Success ---
     total = time.time() - job_start
-    logger.info('[JOB_DONE] id=%s processId=%s file=%s total_elapsed=%.2fs',
-                job.id, process_id, filename, total)
+    logger.info('[JOB_DONE] id=%s processId=%s file=%s pdf=%s total_elapsed=%.2fs',
+                job.id, process_id, filename, pdf_s3_uri or 'none', total)
     logger.info('─' * 50)
     await _publish({
         'processId': process_id,
         'status': 'success',
         'fileName': filename,
         'report': report,
+        'pdfReportUrl': pdf_s3_uri,
     })
 
 
@@ -536,7 +699,13 @@ async def _run_worker():
         await _diagnose_queue(conn, input_queue)
 
         logger.info('[WORKER_CONNECT] Step 3/3: Creating BullMQ Worker on queue=%s', input_queue)
-        worker = Worker(input_queue, _process_job, {'connection': conn})
+        # lockDuration: 20 min — longer than worst-case scan time.
+        # lockRenewTime: renew at half lockDuration (default behaviour).
+        # This prevents the job from moving back to waiting during long scans.
+        worker = Worker(input_queue, _process_job, {
+            'connection': conn,
+            'lockDuration': 45 * 60 * 1000,  # 45 minutes in ms
+        })
         logger.info('[WORKER_READY] ✓ Worker is live and listening for jobs on queue=%s', input_queue)
         logger.info('[WORKER_READY] Watching Redis keys: bull:%s:wait / :active / :delayed', input_queue)
 
