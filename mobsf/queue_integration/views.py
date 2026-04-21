@@ -13,10 +13,6 @@ import time
 
 import redis
 import redis.asyncio
-try:
-    from redis.asyncio.cluster import RedisCluster
-except ImportError:
-    from redis.cluster import RedisCluster
 from ninja import NinjaAPI, Schema
 from ninja.responses import codes_4xx, codes_5xx
 
@@ -184,35 +180,11 @@ async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
     logger.debug(
         f'[REDIS_CONNECT] Attempting connection to {redis_opts["host"]}:{redis_opts["port"]}...')
     try:
-        # For MemoryDB in cluster mode, use RedisCluster with proper configuration
-        # Wrap queue name in curly braces {} for cluster mode (hash slot mapping)
-        host = redis_opts['host']
-        port = redis_opts['port']
-        username = redis_opts.get('username', 'default')
-        password = redis_opts['password']
-        use_ssl = redis_opts.get('ssl', False)
-        ssl_cert_reqs = redis_opts.get('ssl_cert_reqs', None)
+        logger.debug(f'[REDIS_CONNECT] Creating Queue with BullMQ...')
 
-        logger.debug(
-            f'[REDIS_CONNECT] Creating RedisCluster connection (AWS MemoryDB cluster mode)')
-
-        # Create RedisCluster connection with skip_full_coverage_check for single-shard cluster
-        redis_client = RedisCluster(
-            host=host,
-            port=port,
-            username=username,
-            password=password,
-            ssl=use_ssl,
-            ssl_cert_reqs=ssl_cert_reqs,
-            decode_responses=False,  # BullMQ works with binary (msgpack)
-        )
-        logger.debug(f'[REDIS_CONNECT_OK] RedisCluster connection created')
-
-        # Create Queue with RedisCluster connection
-        # queue_name already contains braces from .env (e.g., {app-scanner-requests})
-        q = Queue(queue_name, connection=redis_client)
-        logger.debug(
-            f'[REDIS_CONNECT_OK] Queue object created with RedisCluster connection')
+        # BullMQ creates the appropriate connection (Redis/RedisCluster) from opts dict
+        q = Queue(queue_name, {'connection': redis_opts})
+        logger.debug(f'[REDIS_CONNECT_OK] Queue object created with BullMQ')
     except Exception as e:
         logger.error(
             f'[REDIS_CONNECT_ERROR] Failed to create Queue object: {type(e).__name__}: {e}')
