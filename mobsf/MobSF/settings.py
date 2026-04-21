@@ -370,6 +370,11 @@ LOGGING = {
             'level': 'DEBUG',
             'propagate': False,
         },
+        'mobsf.queue_integration': {
+            'handlers': ['console', 'logfile'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
     },
 }
 ASYNC_ANALYSIS = bool(os.getenv('MOBSF_ASYNC_ANALYSIS', '0') == '1')
