@@ -12,11 +12,6 @@ import os
 import time
 
 import redis
-import redis.asyncio
-try:
-    from redis.asyncio.cluster import RedisCluster
-except ImportError:
-    from redis.cluster import RedisCluster
 from ninja import NinjaAPI, Schema
 from ninja.responses import codes_4xx, codes_5xx
 
@@ -26,6 +21,43 @@ from mobsf.queue_integration.aws_auth import (
     get_memorydb_auth_token,
     should_use_iam_auth,
 )
+
+
+def _patch_bullmq_for_cluster() -> None:
+    """Patch bullmq's RedisConnection to accept redis.RedisCluster.
+
+    bullmq's RedisConnection only checks isinstance(opts, redis.Redis).
+    RedisCluster is not a Redis subclass, so we add explicit support.
+    We also add aclose() to RedisCluster since bullmq calls it during cleanup.
+    """
+    from bullmq.redis_connection import RedisConnection
+    from redis.backoff import ExponentialBackoff
+    from redis.retry import Retry
+    from redis.exceptions import BusyLoadingError
+
+    if getattr(RedisConnection, '_cluster_patched', False):
+        return
+
+    _original_init = RedisConnection.__init__
+
+    def _patched_init(self, redisOpts={}):
+        if isinstance(redisOpts, redis.RedisCluster):
+            self.version = None
+            self.conn = redisOpts
+        else:
+            _original_init(self, redisOpts)
+
+    RedisConnection.__init__ = _patched_init
+    RedisConnection._cluster_patched = True
+
+    # RedisCluster has close() but bullmq calls aclose() (async)
+    if not hasattr(redis.RedisCluster, 'aclose'):
+        async def _aclose(self):
+            self.close()
+        redis.RedisCluster.aclose = _aclose
+
+
+_patch_bullmq_for_cluster()
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -81,81 +113,65 @@ class ErrorResponse(Schema):
 # ---------------------------------------------------------------------------
 
 def _redis_opts() -> dict:
-    """Get Redis/Valkey connection options with production-grade security.
-
-    In production (NODE_ENV=prod):
-    - Fetches password from AWS Secrets Manager
-    - Enables SSL/TLS encryption
-    - Adds connection timeouts (5s connect, 10s read)
-    - Enables keep-alive and health checks
-    - Enables retry on timeout
-
-    In local/dev:
-    - Uses VALKEY_PASSWORD environment variable or defaults to empty
-    - No SSL by default
-    """
     host = os.getenv('VALKEY_HOST', 'localhost')
     port = int(os.getenv('VALKEY_PORT', '6379'))
     username = os.getenv('VALKEY_USERNAME', 'default')
     use_iam = should_use_iam_auth()
 
-    # Get authentication credential (IAM token or static password)
     try:
         logger.debug(
-            f'[REDIS_OPTS] Getting credential for user={username}, host={host}:{port}')
-        logger.debug(
-            f'[REDIS_OPTS] Mode: {"IAM_TOKEN" if use_iam else "STATIC_PASSWORD"}')
-        if use_iam:
-            logger.debug(
-                f'[REDIS_OPTS] Env - VALKEY_HOST={host}')
-            logger.debug(
-                f'[REDIS_OPTS] Env - VALKEY_USERNAME={username}')
-            logger.debug(f'[REDIS_OPTS] Env - AWS_REGION={os.getenv("AWS_REGION")}')
-        else:
-            logger.debug(
-                f'[REDIS_OPTS] Env - VALKEY_PASSWORD_SET={bool(os.getenv("VALKEY_PASSWORD"))}')
-            logger.debug(
-                f'[REDIS_OPTS] Env - MEMORYDB_SECRET_NAME={os.getenv("MEMORYDB_SECRET_NAME")}')
-
+            f'[REDIS_OPTS] Getting credential for user={username}, host={host}:{port}, '
+            f'mode={"IAM_TOKEN" if use_iam else "STATIC_PASSWORD"}')
         password = get_memorydb_auth_token()
-        logger.info(f'[REDIS_OPTS_OK] Credential obtained')
-
+        logger.info('[REDIS_OPTS_OK] Credential obtained')
     except Exception as e:
-        logger.error(f'[REDIS_OPTS_ERROR] Failed: {type(e).__name__}: {e}')
-        logger.error('[REDIS_OPTS_ERROR] Connection will fail', exc_info=True)
+        logger.error(f'[REDIS_OPTS_ERROR] Failed: {type(e).__name__}: {e}', exc_info=True)
         raise
 
     opts = {
         'host': host,
         'port': port,
         'password': password,
-        'username': username,  # Required for both IAM and static auth
+        'username': username,
     }
 
-    # Add production-grade connection settings for MemoryDB/AWS environment
     if use_iam:
         opts.update({
             'ssl': True,
-            'ssl_cert_reqs': None,  # Per AWS docs for MemoryDB IAM auth
-            'socket_timeout': 10,  # Socket timeout for both connect and read (seconds)
-            'decode_responses': False,  # Keep binary for performance
+            'ssl_cert_reqs': None,
+            'socket_timeout': 10,
         })
-        logger.debug(
-            '[REDIS_CONFIG] Production mode: SSL enabled (IAM auth), socket_timeout=10s')
-    else:
-        # Local development: minimal config
-        logger.debug('[REDIS_CONFIG] Development mode: no SSL, default timeouts')
 
-    # Log final configuration summary
-    config_log = (
-        f'[REDIS_CONFIG] host={opts["host"]}:{opts["port"]}, '
-        f'username={opts.get("username", "default")}, '
-        f'password_length={len(password) if password else 0} chars, '
-        f'auth_mode={"IAM_TOKEN" if use_iam else "STATIC_PASSWORD"}, '
-        f'ssl={opts.get("ssl", False)}'
-    )
-    logger.debug(config_log)
+    logger.debug(
+        f'[REDIS_CONFIG] host={host}:{port}, username={username}, '
+        f'ssl={opts.get("ssl", False)}, cluster_mode={use_iam}')
     return opts
+
+
+def _build_queue(queue_name: str) -> Queue:
+    """Create a BullMQ Queue connected to Redis or MemoryDB cluster."""
+    opts = _redis_opts()
+    use_iam = should_use_iam_auth()
+
+    if use_iam:
+        logger.debug('[REDIS_CONNECT] Creating RedisCluster connection (AWS MemoryDB cluster mode)')
+        connection = redis.RedisCluster(
+            host=opts['host'],
+            port=opts['port'],
+            password=opts.get('password'),
+            username=opts.get('username'),
+            ssl=True,
+            ssl_cert_reqs=None,
+            socket_timeout=10,
+            decode_responses=True,
+            skip_full_coverage_check=True,  # MemoryDB doesn't expose full cluster info
+        )
+        logger.debug('[REDIS_CONNECT_OK] RedisCluster connection created')
+    else:
+        logger.debug('[REDIS_CONNECT] Creating Redis connection (local/dev mode)')
+        connection = opts  # bullmq creates redis.Redis from dict in non-cluster mode
+
+    return Queue(queue_name, {'connection': connection})
 
 
 def _get_input_queue() -> str:
@@ -167,55 +183,17 @@ def _get_output_queue() -> str:
 
 
 async def _push_to_queue(process_id: str, url: str, timeout: int = 30) -> None:
-    """Push job to BullMQ queue with timeout protection.
-
-    Args:
-        process_id: Unique process identifier
-        url: URL to download APK from
-        timeout: Timeout in seconds (default 30s)
-    """
     queue_name = _get_input_queue()
     logger.debug(
         f'[ASYNC_PUSH_START] processID={process_id}, queue={queue_name}, url={url}, timeout={timeout}s')
 
     start_time = time.time()
-    redis_opts = _redis_opts()
 
-    logger.debug(
-        f'[REDIS_CONNECT] Attempting connection to {redis_opts["host"]}:{redis_opts["port"]}...')
     try:
-        # For MemoryDB in cluster mode, use RedisCluster with proper configuration
-        # Wrap queue name in curly braces {} for cluster mode (hash slot mapping)
-        host = redis_opts['host']
-        port = redis_opts['port']
-        username = redis_opts.get('username', 'default')
-        password = redis_opts['password']
-        use_ssl = redis_opts.get('ssl', False)
-        ssl_cert_reqs = redis_opts.get('ssl_cert_reqs', None)
-
-        logger.debug(
-            f'[REDIS_CONNECT] Creating RedisCluster connection (AWS MemoryDB cluster mode)')
-
-        # Create RedisCluster connection with skip_full_coverage_check for single-shard cluster
-        redis_client = RedisCluster(
-            host=host,
-            port=port,
-            username=username,
-            password=password,
-            ssl=use_ssl,
-            ssl_cert_reqs=ssl_cert_reqs,
-            decode_responses=False,  # BullMQ works with binary (msgpack)
-        )
-        logger.debug(f'[REDIS_CONNECT_OK] RedisCluster connection created')
-
-        # Create Queue with RedisCluster connection
-        # queue_name already contains braces from .env (e.g., {app-scanner-requests})
-        q = Queue(queue_name, connection=redis_client)
-        logger.debug(
-            f'[REDIS_CONNECT_OK] Queue object created with RedisCluster connection')
+        q = _build_queue(queue_name)
+        logger.debug('[REDIS_CONNECT_OK] Queue object created with BullMQ')
     except Exception as e:
-        logger.error(
-            f'[REDIS_CONNECT_ERROR] Failed to create Queue object: {type(e).__name__}: {e}')
+        logger.error(f'[REDIS_CONNECT_ERROR] Failed to create Queue: {type(e).__name__}: {e}')
         raise
 
     try:
@@ -321,10 +299,11 @@ def push_scan_job(request, payload: ScanJobRequest):
     tags=['Queue'],
 )
 def get_queue_config(request):
-    opts = _redis_opts()
+    host = os.getenv('VALKEY_HOST', 'localhost')
+    port = int(os.getenv('VALKEY_PORT', '6379'))
     return QueueConfig(
         input_queue=_get_input_queue(),
         output_queue=_get_output_queue(),
-        valkey_host=opts['host'],
-        valkey_port=opts['port'],
+        valkey_host=host,
+        valkey_port=port,
     )
