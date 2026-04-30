@@ -99,17 +99,24 @@ def apk_2_java(checksum, app_path, app_dir, dwd_tools_dir):
         # Prepare the base arguments for JADX
         def run_jadx(arguments):
             """Run JADX command with the specified arguments."""
+            # Use nice to prevent JADX from starving other processes (e.g. health checks)
+            niceness = int(os.getenv('MOBSF_JADX_NICE', 10))
+            cmd = ['nice', f'-n{niceness}'] + arguments
             with open(os.devnull, 'w') as fnull:
                 return subprocess.run(
-                    arguments,
+                    cmd,
                     stdout=fnull,
                     stderr=subprocess.STDOUT,
                     timeout=settings.JADX_TIMEOUT)
 
+        jadx_threads = str(int(os.getenv('MOBSF_JADX_THREADS', 2)))
+
         # First attempt to decompile APK
         args = [
             str(jadx), '-ds', str(output_dir),
-            '-q', '-r', '--show-bad-code', app_path]
+            '-q', '-r', '--show-bad-code',
+            '--threads-count', jadx_threads,
+            app_path]
         result = run_jadx(args)
         if result.returncode == 0:
             return  # Success
