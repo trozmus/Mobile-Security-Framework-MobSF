@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import time
 
 import redis
@@ -146,6 +147,27 @@ class QueueConfig(Schema):
 class ErrorResponse(Schema):
     error: str
     message: str
+
+
+class HealthResponse(Schema):
+    status: str
+    version: str
+    tag: str
+    commit: str
+
+
+def _get_commit_hash() -> str:
+    commit = os.getenv('MOBSFSCAN_COMMIT')
+    if commit:
+        return commit
+    try:
+        return subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return 'unknown'
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +315,23 @@ async def _push_to_queue(process_id: str, process_type: str, url: str, timeout: 
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@api.get(
+    '/health',
+    response={200: HealthResponse},
+    summary='Health check',
+    description='Returns service status and version.',
+    tags=['Health'],
+    auth=None,
+)
+def health_check(request):
+    return HealthResponse(
+        status='ok',
+        version=api.version,
+        tag=os.getenv('MOBSFSCAN_TAG', 'unknown'),
+        commit=_get_commit_hash(),
+    )
+
 
 @api.post(
     '/push',
