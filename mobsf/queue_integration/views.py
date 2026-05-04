@@ -10,7 +10,6 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
 import time
 
 import redis
@@ -157,17 +156,7 @@ class HealthResponse(Schema):
 
 
 def _get_commit_hash() -> str:
-    commit = os.getenv('MOBSFSCAN_COMMIT')
-    if commit:
-        return commit
-    try:
-        return subprocess.check_output(
-            ['git', 'rev-parse', '--short', 'HEAD'],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-    except Exception:
-        return 'unknown'
+    return os.getenv('MOBSFSCAN_COMMIT', 'unknown')
 
 
 # ---------------------------------------------------------------------------
