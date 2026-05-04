@@ -397,9 +397,9 @@ async def _publish(payload: dict, max_retries: int = 2) -> None:
         q = _build_queue(queue_name)
         try:
             job = await q.add(job_name, payload)
-            logger.info('[PUBLISH_OK] job=%s id=%s queue=%s processId=%s',
+            logger.info('[PUBLISH_OK] job=%s id=%s queue=%s appProcessId=%s',
                         job_name, job.id if hasattr(job, 'id') else 'unknown',
-                        queue_name, payload.get('processId'))
+                        queue_name, payload.get('appProcessId'))
             return
         except (AuthenticationError, RedisConnectionError) as e:
             last_error = e
@@ -440,15 +440,15 @@ async def _process_job(job, token):
         logger.warning('[JOB_SKIP] id=%s looks like a result payload — check queue routing', job.id)
         return
 
-    process_id = job_data.get('processId') or job_data.get('processID')
+    process_id = job_data.get('appProcessId')
     url = job_data.get('url')
     process_type = job_data.get('processType', '?')
 
     if not process_id or not url:
-        logger.error('[JOB_INVALID] id=%s missing processId=%r or url=%r', job.id, process_id, url)
+        logger.error('[JOB_INVALID] id=%s missing appProcessId=%r or url=%r', job.id, process_id, url)
         return
 
-    logger.info('[JOB_START] id=%s processId=%s processType=%s url=%s',
+    logger.info('[JOB_START] id=%s appProcessId=%s processType=%s url=%s',
                 job.id, process_id, process_type, url)
 
     loop = asyncio.get_event_loop()
@@ -460,9 +460,9 @@ async def _process_job(job, token):
         logger.info('[JOB_DOWNLOAD_OK] id=%s file=%s size=%d bytes elapsed=%.2fs',
                     job.id, filename, len(apk_bytes), time.time() - t0)
     except Exception as exc:
-        logger.error('[JOB_DOWNLOAD_FAIL] id=%s processId=%s elapsed=%.2fs error=%s: %s',
+        logger.error('[JOB_DOWNLOAD_FAIL] id=%s appProcessId=%s elapsed=%.2fs error=%s: %s',
                      job.id, process_id, time.time() - t0, type(exc).__name__, exc)
-        await _publish({'processId': process_id, 'status': 'error',
+        await _publish({'appProcessId': process_id, 'status': 'error',
                         'error': 'download_failed', 'message': str(exc)})
         return
 
@@ -472,9 +472,9 @@ async def _process_job(job, token):
         checksum, report = await loop.run_in_executor(None, _run_static_scan, filename, apk_bytes)
         logger.info('[JOB_SCAN_OK] id=%s file=%s elapsed=%.2fs', job.id, filename, time.time() - t0)
     except Exception as exc:
-        logger.error('[JOB_SCAN_FAIL] id=%s processId=%s file=%s elapsed=%.2fs error=%s: %s',
+        logger.error('[JOB_SCAN_FAIL] id=%s appProcessId=%s file=%s elapsed=%.2fs error=%s: %s',
                      job.id, process_id, filename, time.time() - t0, type(exc).__name__, exc)
-        await _publish({'processId': process_id, 'status': 'error',
+        await _publish({'appProcessId': process_id, 'status': 'error',
                         'error': 'scan_failed', 'message': str(exc), 'fileName': filename})
         return
 
@@ -488,10 +488,10 @@ async def _process_job(job, token):
         logger.warning('[JOB_PDF_SKIP] id=%s PDF generation failed or skipped', job.id)
 
     # --- Done ---
-    logger.info('[JOB_DONE] id=%s processId=%s file=%s pdf=%s total_elapsed=%.2fs',
+    logger.info('[JOB_DONE] id=%s appProcessId=%s file=%s pdf=%s total_elapsed=%.2fs',
                 job.id, process_id, filename, pdf_s3_uri or 'none', time.time() - job_start)
     await _publish({
-        'processId': process_id,
+        'appProcessId': process_id,
         'status': 'success',
         'fileName': filename,
         'report': report,

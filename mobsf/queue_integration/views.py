@@ -116,14 +116,14 @@ def log_unhandled(request, exc):
 # ---------------------------------------------------------------------------
 
 class ScanJobRequest(Schema):
-    processID: str
+    appProcessId: str
     processType: str = 'APP_REVIEW'
     url: str
 
     class Config:
         json_schema_extra = {
             'example': {
-                'processID': '123e4567-e89b-12d3-a456-426614174000',
+                'appProcessId': '123e4567-e89b-12d3-a456-426614174000',
                 'processType': 'APP_REVIEW',
                 'url': 'https://example.com/app.apk',
             }
@@ -132,7 +132,7 @@ class ScanJobRequest(Schema):
 
 class ScanJobQueued(Schema):
     status: str
-    processID: str
+    appProcessId: str
     queue: str
 
 
@@ -251,7 +251,7 @@ def _ensure_cluster_safe_name(queue_name: str) -> str:
 async def _push_to_queue(process_id: str, process_type: str, url: str, timeout: int = 30) -> None:
     queue_name = _ensure_cluster_safe_name(_get_input_queue())
     logger.debug(
-        f'[ASYNC_PUSH_START] processId={process_id}, processType={process_type}, queue={queue_name}, url={url}, timeout={timeout}s')
+        f'[ASYNC_PUSH_START] appProcessId={process_id}, processType={process_type}, queue={queue_name}, url={url}, timeout={timeout}s')
 
     start_time = time.time()
 
@@ -269,7 +269,7 @@ async def _push_to_queue(process_id: str, process_type: str, url: str, timeout: 
         try:
             job = await asyncio.wait_for(
                 q.add('app-binary-scan-requested', {
-                    'processId': process_id,
+                    'appProcessId': process_id,
                     'processType': process_type,
                     'url': url,
                 }),
@@ -277,11 +277,11 @@ async def _push_to_queue(process_id: str, process_type: str, url: str, timeout: 
             )
             elapsed = time.time() - start_time
             logger.info(
-                f'[QUEUE_ADD_OK] Job added successfully in {elapsed:.2f}s | processID={process_id} | queue={queue_name} | job_id={job.id if hasattr(job, "id") else "unknown"}')
+                f'[QUEUE_ADD_OK] Job added successfully in {elapsed:.2f}s | appProcessId={process_id} | queue={queue_name} | job_id={job.id if hasattr(job, "id") else "unknown"}')
         except asyncio.TimeoutError:
             elapsed = time.time() - start_time
             logger.error(
-                f'[QUEUE_ADD_TIMEOUT] Queue add operation timed out after {timeout}s | elapsed={elapsed:.2f}s | processID={process_id} | queue={queue_name}')
+                f'[QUEUE_ADD_TIMEOUT] Queue add operation timed out after {timeout}s | elapsed={elapsed:.2f}s | appProcessId={process_id} | queue={queue_name}')
             raise TimeoutError(f'Queue add operation timed out after {timeout}s')
 
     except TimeoutError:
@@ -289,7 +289,7 @@ async def _push_to_queue(process_id: str, process_type: str, url: str, timeout: 
     except Exception as e:
         elapsed = time.time() - start_time
         logger.error(
-            f'[QUEUE_ADD_ERROR] Failed after {elapsed:.2f}s: {type(e).__name__}: {e} | processID={process_id}')
+            f'[QUEUE_ADD_ERROR] Failed after {elapsed:.2f}s: {type(e).__name__}: {e} | appProcessId={process_id}')
         raise
     finally:
         try:
@@ -334,10 +334,10 @@ def health_check(request):
     tags=['Queue'],
 )
 def push_scan_job(request, payload: ScanJobRequest):
-    request_id = f"{payload.processID}-{int(time.time()*1000)}"
+    request_id = f"{payload.appProcessId}-{int(time.time()*1000)}"
 
     logger.info(
-        f'[REQUEST_START] request_id={request_id} | processId={payload.processID} | processType={payload.processType} | url={payload.url}')
+        f'[REQUEST_START] request_id={request_id} | appProcessId={payload.appProcessId} | processType={payload.processType} | url={payload.url}')
     logger.debug(
         f'[REQUEST_DETAILS] method={request.method}, path={request.path}, client_ip={request.META.get("REMOTE_ADDR")}')
 
@@ -347,10 +347,10 @@ def push_scan_job(request, payload: ScanJobRequest):
     try:
         logger.debug(
             f'[ASYNCIO_RUN_START] request_id={request_id} | Starting async task...')
-        asyncio.run(_push_to_queue(payload.processID, payload.processType, payload.url))
+        asyncio.run(_push_to_queue(payload.appProcessId, payload.processType, payload.url))
         elapsed = time.time() - start_time
         logger.info(
-            f'[REQUEST_SUCCESS] request_id={request_id} | Completed in {elapsed:.2f}s | processId={payload.processID}')
+            f'[REQUEST_SUCCESS] request_id={request_id} | Completed in {elapsed:.2f}s | appProcessId={payload.appProcessId}')
 
     except TimeoutError as exc:
         elapsed = time.time() - start_time
@@ -372,7 +372,7 @@ def push_scan_job(request, payload: ScanJobRequest):
 
     return 200, ScanJobQueued(
         status='queued',
-        processID=payload.processID,
+        appProcessId=payload.appProcessId,
         queue=queue_name,
     )
 
