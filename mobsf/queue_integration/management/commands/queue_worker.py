@@ -471,8 +471,7 @@ async def _process_job(job, token):
     t0 = time.time()
     try:
         checksum, report = await loop.run_in_executor(None, _run_static_scan, filename, apk_bytes)
-        db_entry = StaticAnalyzerAndroid.objects.filter(MD5=checksum)
-        appsec = get_android_dashboard(db_entry)
+        appsec = get_android_dashboard(report, from_ctx=True)
         report['security_score'] = appsec.get('security_score')
         logger.info('[JOB_SCAN_OK] id=%s file=%s elapsed=%.2fs', job.id, filename, time.time() - t0)
     except Exception as exc:
