@@ -388,7 +388,7 @@ def _run_static_scan(filename: str, apk_bytes: bytes) -> tuple[str, dict]:
 # ---------------------------------------------------------------------------
 
 async def _publish(payload: dict, max_retries: int = 2) -> None:
-    is_error = payload.get('status') == 'error'
+    is_error = payload.get('status') == 'FAILED'
     queue_name = _get_errors_queue() if is_error else _get_output_queue()
     job_name = 'app-binary-scan-error' if is_error else 'app-binary-scan-result'
 
@@ -436,11 +436,12 @@ async def _process_job(job, token):
 
     job_data = job.data.get('jobData', job.data)
 
-    if 'report' in job_data or ('status' in job_data and job_data['status'] in ('success', 'error')):
+    if 'report' in job_data or ('status' in job_data and job_data['status'] in ('COMPLETED', 'FAILED')):
         logger.warning('[JOB_SKIP] id=%s looks like a result payload — check queue routing', job.id)
         return
 
     process_id = job_data.get('appProcessId')
+    scan_execution_id = job_data.get('appScanExecutionId')
     url = job_data.get('url')
     process_type = job_data.get('processType', '?')
 
@@ -462,20 +463,23 @@ async def _process_job(job, token):
     except Exception as exc:
         logger.error('[JOB_DOWNLOAD_FAIL] id=%s appProcessId=%s elapsed=%.2fs error=%s: %s',
                      job.id, process_id, time.time() - t0, type(exc).__name__, exc)
-        await _publish({'appProcessId': process_id, 'status': 'error',
-                        'error': 'download_failed', 'message': str(exc)})
+        await _publish({'appProcessId': process_id, 'appScanExecutionId': scan_execution_id,
+                        'status': 'FAILED', 'error': 'download_failed', 'message': str(exc)})
         return
 
     # --- Scan ---
     t0 = time.time()
     try:
         checksum, report = await loop.run_in_executor(None, _run_static_scan, filename, apk_bytes)
+        db_entry = StaticAnalyzerAndroid.objects.filter(MD5=checksum)
+        appsec = get_android_dashboard(db_entry)
+        report['security_score'] = appsec.get('security_score')
         logger.info('[JOB_SCAN_OK] id=%s file=%s elapsed=%.2fs', job.id, filename, time.time() - t0)
     except Exception as exc:
         logger.error('[JOB_SCAN_FAIL] id=%s appProcessId=%s file=%s elapsed=%.2fs error=%s: %s',
                      job.id, process_id, filename, time.time() - t0, type(exc).__name__, exc)
-        await _publish({'appProcessId': process_id, 'status': 'error',
-                        'error': 'scan_failed', 'message': str(exc), 'fileName': filename})
+        await _publish({'appProcessId': process_id, 'appScanExecutionId': scan_execution_id,
+                        'status': 'FAILED', 'error': 'scan_failed', 'message': str(exc), 'fileName': filename})
         return
 
     # --- Generate and upload PDF ---
@@ -492,7 +496,8 @@ async def _process_job(job, token):
                 job.id, process_id, filename, pdf_s3_uri or 'none', time.time() - job_start)
     await _publish({
         'appProcessId': process_id,
-        'status': 'success',
+        'appScanExecutionId': scan_execution_id,
+        'status': 'COMPLETED',
         'fileName': filename,
         'report': report,
         'pdfReportUrl': pdf_s3_uri,
