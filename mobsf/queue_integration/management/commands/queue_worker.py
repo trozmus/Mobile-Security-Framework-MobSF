@@ -420,6 +420,21 @@ async def _publish(payload: dict, job_name: str, max_retries: int = 2) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Lock renewal helper
+# ---------------------------------------------------------------------------
+
+_LOCK_DURATION_MS = 45 * 60 * 1000
+
+
+async def _extend_lock(job, token: str) -> None:
+    try:
+        await job.scripts.extendLock(job.id, token, _LOCK_DURATION_MS)
+        logger.debug('[LOCK_EXTENDED] job=%s', job.id)
+    except Exception as e:
+        logger.warning('[LOCK_EXTEND_FAIL] job=%s: %s', job.id, e)
+
+
+# ---------------------------------------------------------------------------
 # Job processor
 # ---------------------------------------------------------------------------
 
@@ -459,6 +474,7 @@ async def _process_job(job, token):
         apk_bytes, filename = await loop.run_in_executor(None, _download_apk, url)
         logger.info('[JOB_DOWNLOAD_OK] id=%s file=%s size=%d bytes elapsed=%.2fs',
                     job.id, filename, len(apk_bytes), time.time() - t0)
+        await _extend_lock(job, token)
     except Exception as exc:
         logger.error('[JOB_DOWNLOAD_FAIL] id=%s appProcessId=%s elapsed=%.2fs error=%s: %s',
                      job.id, process_id, time.time() - t0, type(exc).__name__, exc)
@@ -474,6 +490,7 @@ async def _process_job(job, token):
         appsec = get_android_dashboard(report, from_ctx=True)
         report['security_score'] = appsec.get('security_score')
         logger.info('[JOB_SCAN_OK] id=%s file=%s elapsed=%.2fs', job.id, filename, time.time() - t0)
+        await _extend_lock(job, token)
     except Exception as exc:
         logger.error('[JOB_SCAN_FAIL] id=%s appProcessId=%s file=%s elapsed=%.2fs error=%s: %s',
                      job.id, process_id, filename, time.time() - t0, type(exc).__name__, exc)
@@ -490,6 +507,7 @@ async def _process_job(job, token):
         pdf_s3_uri = await loop.run_in_executor(None, _upload_pdf_to_s3, pdf_bytes, url, checksum)
     else:
         logger.warning('[JOB_PDF_SKIP] id=%s PDF generation failed or skipped', job.id)
+    await _extend_lock(job, token)
 
     # --- Done ---
     logger.info('[JOB_DONE] id=%s appProcessId=%s file=%s pdf=%s total_elapsed=%.2fs',
@@ -532,7 +550,7 @@ async def _run_worker():
         # Prevents job from moving back to waiting during long scans.
         worker = Worker(input_queue, _process_job, {
             'connection': conn,
-            'lockDuration': 45 * 60 * 1000,
+            'lockDuration': _LOCK_DURATION_MS,
         })
         logger.info('[WORKER_READY] Listening on queue=%s', input_queue)
 

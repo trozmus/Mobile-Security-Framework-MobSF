@@ -151,6 +151,39 @@ class ErrorResponse(Schema):
     message: str
 
 
+class QueueStats(Schema):
+    queue: str
+    waiting: int
+    active: int
+    completed: int
+    failed: int
+    delayed: int
+    paused: int
+
+
+class QueueStatsResponse(Schema):
+    queues: list[QueueStats]
+
+
+class JobSummary(Schema):
+    id: str
+    name: str
+    status: str
+    timestamp: int | None
+    processedOn: int | None
+    finishedOn: int | None
+    attemptsMade: int
+    failedReason: str | None
+    data_keys: list[str]
+
+
+class JobListResponse(Schema):
+    queue: str
+    status: str
+    total: int
+    jobs: list[JobSummary]
+
+
 class HealthResponse(Schema):
     status: str
     version: str
@@ -400,3 +433,124 @@ def get_queue_config(request):
         valkey_host=host,
         valkey_port=port,
     )
+
+
+async def _get_queue_stats(queue_name: str) -> QueueStats:
+    q = _build_queue(queue_name)
+    try:
+        counts = await q.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed', 'paused')
+        return QueueStats(
+            queue=queue_name,
+            waiting=counts.get('waiting', 0),
+            active=counts.get('active', 0),
+            completed=counts.get('completed', 0),
+            failed=counts.get('failed', 0),
+            delayed=counts.get('delayed', 0),
+            paused=counts.get('paused', 0),
+        )
+    finally:
+        try:
+            await q.close()
+        except Exception:
+            pass
+
+
+@api.get(
+    '/stats',
+    response={200: QueueStatsResponse, codes_5xx: ErrorResponse},
+    summary='Get job counts for all queues',
+    description='Returns waiting/active/completed/failed/delayed/paused counts for input, output and errors queues.',
+    tags=['Queue'],
+)
+def get_queue_stats(request):
+    queue_names = [
+        _get_input_queue(),
+        _get_output_queue(),
+        os.getenv('QUEUE_ERRORS', '{app-scanner-errors}'),
+    ]
+    try:
+        stats = asyncio.run(asyncio.gather(*[_get_queue_stats(q) for q in queue_names]))
+        return 200, QueueStatsResponse(queues=list(stats))
+    except Exception as exc:
+        logger.exception('[STATS_ERROR]')
+        return 500, ErrorResponse(error='stats_error', message=str(exc))
+
+
+def _job_to_summary(job, status: str) -> JobSummary:
+    data = job.data or {}
+    job_data = data.get('jobData', data)
+    return JobSummary(
+        id=str(job.id),
+        name=job.name or '',
+        status=status,
+        timestamp=getattr(job, 'timestamp', None),
+        processedOn=getattr(job, 'processedOn', None),
+        finishedOn=getattr(job, 'finishedOn', None),
+        attemptsMade=getattr(job, 'attemptsMade', 0) or 0,
+        failedReason=getattr(job, 'failedReason', None),
+        data_keys=list(job_data.keys()) if isinstance(job_data, dict) else list(data.keys()),
+    )
+
+
+async def _get_jobs(queue_name: str, status: str, start: int, end: int) -> list[JobSummary]:
+    q = _build_queue(queue_name)
+    try:
+        method_map = {
+            'waiting': q.getWaiting,
+            'active': q.getActive,
+            'completed': q.getCompleted,
+            'failed': q.getFailed,
+            'delayed': q.getDelayed,
+        }
+        getter = method_map.get(status)
+        if getter is None:
+            raise ValueError(f'Unknown status: {status}')
+        jobs = await getter(start, end)
+        return [_job_to_summary(j, status) for j in jobs]
+    finally:
+        try:
+            await q.close()
+        except Exception:
+            pass
+
+
+VALID_STATUSES = {'waiting', 'active', 'completed', 'failed', 'delayed'}
+QUEUE_ALIASES = {
+    'input': lambda: _get_input_queue(),
+    'output': lambda: _get_output_queue(),
+    'errors': lambda: os.getenv('QUEUE_ERRORS', '{app-scanner-errors}'),
+}
+
+
+@api.get(
+    '/jobs/{queue_name}/{status}',
+    response={200: JobListResponse, codes_4xx: ErrorResponse, codes_5xx: ErrorResponse},
+    summary='List jobs by queue and status',
+    description=(
+        'Returns a list of jobs for a given queue and status. '
+        'Use queue aliases: `input`, `output`, `errors`. '
+        f'Valid statuses: {", ".join(sorted(VALID_STATUSES))}. '
+        'Pagination via `start` and `end` (0-based, inclusive).'
+    ),
+    tags=['Queue'],
+)
+def list_jobs(request, queue_name: str, status: str, start: int = 0, end: int = 49):
+    if status not in VALID_STATUSES:
+        return 400, ErrorResponse(
+            error='invalid_status',
+            message=f'Status must be one of: {", ".join(sorted(VALID_STATUSES))}',
+        )
+    resolved = QUEUE_ALIASES.get(queue_name, lambda: queue_name)()
+    try:
+        jobs = asyncio.run(_get_jobs(resolved, status, start, end))
+        return 200, JobListResponse(
+            queue=resolved,
+            status=status,
+            total=len(jobs),
+            jobs=jobs,
+        )
+    except ValueError as exc:
+        return 400, ErrorResponse(error='invalid_request', message=str(exc))
+    except Exception as exc:
+        logger.exception('[LIST_JOBS_ERROR] queue=%s status=%s', resolved, status)
+        return 500, ErrorResponse(error='list_jobs_error', message=str(exc))
