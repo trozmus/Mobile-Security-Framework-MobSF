@@ -387,10 +387,9 @@ def _run_static_scan(filename: str, apk_bytes: bytes) -> tuple[str, dict]:
 # Publish result
 # ---------------------------------------------------------------------------
 
-async def _publish(payload: dict, max_retries: int = 2) -> None:
+async def _publish(payload: dict, job_name: str, max_retries: int = 2) -> None:
     is_error = payload.get('status') == 'FAILED'
     queue_name = _get_errors_queue() if is_error else _get_output_queue()
-    job_name = 'app-binary-scan-error' if is_error else 'app-binary-scan-result'
 
     last_error = None
     for attempt in range(max_retries):
@@ -464,7 +463,8 @@ async def _process_job(job, token):
         logger.error('[JOB_DOWNLOAD_FAIL] id=%s appProcessId=%s elapsed=%.2fs error=%s: %s',
                      job.id, process_id, time.time() - t0, type(exc).__name__, exc)
         await _publish({'appProcessId': process_id, 'appScanExecutionId': scan_execution_id,
-                        'status': 'FAILED', 'error': 'download_failed', 'message': str(exc)})
+                        'status': 'FAILED', 'error': 'download_failed', 'message': str(exc)},
+                       job_name='app-binary-scan-result-download-error')
         return
 
     # --- Scan ---
@@ -478,7 +478,8 @@ async def _process_job(job, token):
         logger.error('[JOB_SCAN_FAIL] id=%s appProcessId=%s file=%s elapsed=%.2fs error=%s: %s',
                      job.id, process_id, filename, time.time() - t0, type(exc).__name__, exc)
         await _publish({'appProcessId': process_id, 'appScanExecutionId': scan_execution_id,
-                        'status': 'FAILED', 'error': 'scan_failed', 'message': str(exc), 'fileName': filename})
+                        'status': 'FAILED', 'error': 'scan_failed', 'message': str(exc), 'fileName': filename},
+                       job_name='app-binary-scan-result-scan-error')
         return
 
     # --- Generate and upload PDF ---
@@ -500,7 +501,7 @@ async def _process_job(job, token):
         'fileName': filename,
         'report': report,
         'pdfReportUrl': pdf_s3_uri,
-    })
+    }, job_name='app-binary-scan-result-success')
 
 
 # ---------------------------------------------------------------------------
