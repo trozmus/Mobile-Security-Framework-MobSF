@@ -423,7 +423,9 @@ async def _publish(payload: dict, job_name: str, max_retries: int = 2) -> None:
 # Lock renewal helper
 # ---------------------------------------------------------------------------
 
-_LOCK_DURATION_MS = 45 * 60 * 1000
+_LOCK_DURATION_MS = int(os.getenv('BULLMQ_LOCK_DURATION_MS', 45 * 60 * 1000))
+_MAX_STALLED_COUNT = int(os.getenv('BULLMQ_MAX_STALLED_COUNT', 0))
+_STALLED_INTERVAL_MS = int(os.getenv('BULLMQ_STALLED_INTERVAL_MS', _LOCK_DURATION_MS))
 
 
 async def _extend_lock(job, token: str) -> None:
@@ -547,10 +549,14 @@ async def _run_worker():
             return True
 
         # lockDuration 45 min — longer than worst-case scan time (~30 min).
-        # Prevents job from moving back to waiting during long scans.
+        # maxStalledCount 0 — never auto-move stalled jobs to completed/failed,
+        # manual lock renewal in _process_job handles lock extension between steps.
+        # stalledInterval matches lockDuration to avoid premature stale detection.
         worker = Worker(input_queue, _process_job, {
             'connection': conn,
             'lockDuration': _LOCK_DURATION_MS,
+            'maxStalledCount': _MAX_STALLED_COUNT,
+            'stalledInterval': _STALLED_INTERVAL_MS,
         })
         logger.info('[WORKER_READY] Listening on queue=%s', input_queue)
 
