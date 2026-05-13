@@ -184,6 +184,17 @@ class JobListResponse(Schema):
     jobs: list[JobSummary]
 
 
+class ScanLogEntry(Schema):
+    timestamp: str
+    status: str
+    exception: str | None
+
+
+class ScanLogsResponse(Schema):
+    checksum: str
+    logs: list[ScanLogEntry]
+
+
 class HealthResponse(Schema):
     status: str
     version: str
@@ -343,6 +354,76 @@ async def _push_to_queue(process_id: str, scan_execution_id: str, process_type: 
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+def _redis_sync_client():
+    """Return a sync redis.Redis client using current env config."""
+    from mobsf.queue_integration.aws_auth import get_memorydb_auth_token, should_use_iam_auth
+    host = os.getenv('VALKEY_HOST', 'localhost')
+    port = int(os.getenv('VALKEY_PORT', '6379'))
+    username = os.getenv('VALKEY_USERNAME', 'default')
+    password = get_memorydb_auth_token()
+    opts = {'host': host, 'port': port, 'username': username, 'password': password, 'decode_responses': True}
+    if should_use_iam_auth():
+        opts.update({'ssl': True, 'ssl_cert_reqs': None})
+    return redis.Redis(**opts)
+
+
+def _resolve_checksum(appScanExecutionId: str | None, appProcessId: str | None) -> str | None:
+    r = _redis_sync_client()
+    try:
+        if appScanExecutionId:
+            v = r.get(f'mobsf:scan_exec:{appScanExecutionId}')
+            if v:
+                return v
+        if appProcessId:
+            v = r.get(f'mobsf:scan_proc:{appProcessId}')
+            if v:
+                return v
+        return None
+    finally:
+        r.close()
+
+
+@api.get(
+    '/scan/logs',
+    response={200: ScanLogsResponse, codes_4xx: ErrorResponse, codes_5xx: ErrorResponse},
+    summary='Get scan progress logs',
+    description=(
+        'Returns MobSF scan stage logs for a given `appScanExecutionId` or `appProcessId`. '
+        'Logs are available as soon as the scan starts and are updated in real time. '
+        'Requires at least one of the two query parameters.'
+    ),
+    tags=['Scan'],
+)
+def get_scan_logs(request, appScanExecutionId: str = None, appProcessId: str = None):
+    from mobsf.MobSF.utils import get_scan_logs as _get_scan_logs
+    if not appScanExecutionId and not appProcessId:
+        return 400, ErrorResponse(
+            error='missing_param',
+            message='Provide appScanExecutionId or appProcessId',
+        )
+    try:
+        checksum = _resolve_checksum(appScanExecutionId, appProcessId)
+    except Exception as exc:
+        logger.exception('[SCAN_LOGS_REDIS_ERROR]')
+        return 500, ErrorResponse(error='redis_error', message=str(exc))
+
+    if not checksum:
+        return 404, ErrorResponse(
+            error='not_found',
+            message='No scan found for the given ID. Scan may not have started yet or mapping expired.',
+        )
+    raw_logs = _get_scan_logs(checksum)
+    logs = [
+        ScanLogEntry(
+            timestamp=entry.get('timestamp', ''),
+            status=entry.get('status', ''),
+            exception=entry.get('exception'),
+        )
+        for entry in raw_logs
+    ]
+    return 200, ScanLogsResponse(checksum=checksum, logs=logs)
+
 
 @api.get(
     '/health',

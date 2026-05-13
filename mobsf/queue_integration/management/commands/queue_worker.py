@@ -344,9 +344,40 @@ def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str, checksum: str) -> str |
 # Static scan
 # ---------------------------------------------------------------------------
 
-def _run_static_scan(filename: str, apk_bytes: bytes) -> tuple[str, dict]:
+def _store_scan_mapping(scan_execution_id: str | None, process_id: str | None, checksum: str) -> None:
+    """Store appScanExecutionId/appProcessId → checksum mapping in Redis for scan log lookups."""
+    if not scan_execution_id and not process_id:
+        return
+    try:
+        host = os.getenv('VALKEY_HOST', 'localhost')
+        port = int(os.getenv('VALKEY_PORT', '6379'))
+        username = os.getenv('VALKEY_USERNAME', 'default')
+        from mobsf.queue_integration.aws_auth import get_memorydb_auth_token, should_use_iam_auth
+        password = get_memorydb_auth_token()
+        opts = {'host': host, 'port': port, 'username': username, 'password': password, 'decode_responses': True}
+        if should_use_iam_auth():
+            opts.update({'ssl': True, 'ssl_cert_reqs': None})
+        r = redis.Redis(**opts)
+        ttl = 7 * 24 * 3600
+        if scan_execution_id:
+            r.setex(f'mobsf:scan_exec:{scan_execution_id}', ttl, checksum)
+        if process_id:
+            r.setex(f'mobsf:scan_proc:{process_id}', ttl, checksum)
+        r.close()
+        logger.debug('[SCAN_MAP_STORED] scan_execution_id=%s process_id=%s checksum=%s',
+                     scan_execution_id, process_id, checksum)
+    except Exception as e:
+        logger.warning('[SCAN_MAP_FAIL] Could not store scan mapping: %s', e)
+
+
+def _run_static_scan(
+        filename: str, apk_bytes: bytes,
+        scan_execution_id: str | None = None,
+        process_id: str | None = None,
+) -> tuple[str, dict]:
     buf = io.BufferedReader(io.BytesIO(apk_bytes))
     checksum = handle_uploaded_file(buf, '.apk')
+    _store_scan_mapping(scan_execution_id, process_id, checksum)
 
     add_to_recent_scan({
         'analyzer': 'static_analyzer',
@@ -488,7 +519,8 @@ async def _process_job(job, token):
     # --- Scan ---
     t0 = time.time()
     try:
-        checksum, report = await loop.run_in_executor(None, _run_static_scan, filename, apk_bytes)
+        checksum, report = await loop.run_in_executor(
+            None, _run_static_scan, filename, apk_bytes, scan_execution_id, process_id)
         appsec = get_android_dashboard(report, from_ctx=True)
         report['security_score'] = appsec.get('security_score')
         logger.info('[JOB_SCAN_OK] id=%s file=%s elapsed=%.2fs', job.id, filename, time.time() - t0)
