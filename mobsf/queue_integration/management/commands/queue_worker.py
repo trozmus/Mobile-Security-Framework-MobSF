@@ -667,11 +667,13 @@ async def _recover_stalled_jobs(input_queue: str, conn) -> None:
 
             if stalled:
                 try:
+                    # active jobs must be moved to failed first before retry() can be called
+                    await job.moveToFailed(Exception('stalled'), '0')
                     await job.retry()
-                    logger.warning('[RECOVER] job=%s appProcessId=%s retried — %s',
+                    logger.warning('[RECOVER] job=%s appProcessId=%s moved to waiting — %s',
                                    job.id, process_id, reason)
                 except Exception as e:
-                    logger.error('[RECOVER] job=%s retry failed: %s', job.id, e)
+                    logger.error('[RECOVER] job=%s recovery failed: %s', job.id, e)
 
         if r:
             try:
