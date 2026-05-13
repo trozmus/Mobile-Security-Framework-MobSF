@@ -576,7 +576,9 @@ async def _recover_stalled_jobs(input_queue: str, conn) -> None:
     - the last SCAN_LOG entry is older than BULLMQ_STALL_THRESHOLD_S seconds.
     """
     from datetime import datetime, timezone as tz
+    from asgiref.sync import sync_to_async
     from mobsf.MobSF.utils import get_scan_logs
+    get_scan_logs_async = sync_to_async(get_scan_logs)
 
     q = Queue(input_queue, {'connection': conn})
     try:
@@ -644,7 +646,7 @@ async def _recover_stalled_jobs(input_queue: str, conn) -> None:
                 stalled = True
                 reason = 'no checksum mapping in Redis (scan never started)'
             else:
-                logs = get_scan_logs(checksum)
+                logs = await get_scan_logs_async(checksum)
                 if not logs:
                     stalled = True
                     reason = f'checksum={checksum} but no scan logs in DB'
