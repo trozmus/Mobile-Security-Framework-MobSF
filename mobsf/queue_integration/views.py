@@ -184,6 +184,13 @@ class JobListResponse(Schema):
     jobs: list[JobSummary]
 
 
+class JobActionResponse(Schema):
+    job_id: str
+    queue: str
+    action: str
+    status: str
+
+
 class ScanLogEntry(Schema):
     timestamp: str
     status: str
@@ -635,3 +642,72 @@ def list_jobs(request, queue_name: str, status: str, start: int = 0, end: int = 
     except Exception as exc:
         logger.exception('[LIST_JOBS_ERROR] queue=%s status=%s', resolved, status)
         return 500, ErrorResponse(error='list_jobs_error', message=str(exc))
+
+
+async def _job_action(queue_name: str, job_id: str, action: str) -> JobActionResponse:
+    from bullmq import Job
+    q = _build_queue(queue_name)
+    try:
+        job = await Job.fromId(q, job_id)
+        if job is None:
+            raise ValueError(f'Job {job_id} not found in queue {queue_name}')
+        if action == 'retry':
+            await job.retry()
+        elif action == 'remove':
+            await job.remove()
+        else:
+            raise ValueError(f'Unknown action: {action}')
+        return JobActionResponse(job_id=job_id, queue=queue_name, action=action, status='ok')
+    finally:
+        try:
+            await q.close()
+        except Exception:
+            pass
+
+
+@api.post(
+    '/jobs/{queue_name}/{job_id}/retry',
+    response={200: JobActionResponse, codes_4xx: ErrorResponse, codes_5xx: ErrorResponse},
+    summary='Retry a job',
+    description=(
+        'Moves a job back to `waiting` so it can be picked up again by the worker. '
+        'Use this to recover stalled `active` or `failed` jobs. '
+        'Use queue aliases: `input`, `output`, `errors`.'
+    ),
+    tags=['Queue'],
+)
+def retry_job(request, queue_name: str, job_id: str):
+    resolved = QUEUE_ALIASES.get(queue_name, lambda: queue_name)()
+    try:
+        result = asyncio.run(_job_action(resolved, job_id, 'retry'))
+        logger.info('[JOB_RETRY] queue=%s job_id=%s', resolved, job_id)
+        return 200, result
+    except ValueError as exc:
+        return 404, ErrorResponse(error='not_found', message=str(exc))
+    except Exception as exc:
+        logger.exception('[JOB_RETRY_ERROR] queue=%s job_id=%s', resolved, job_id)
+        return 500, ErrorResponse(error='retry_error', message=str(exc))
+
+
+@api.delete(
+    '/jobs/{queue_name}/{job_id}',
+    response={200: JobActionResponse, codes_4xx: ErrorResponse, codes_5xx: ErrorResponse},
+    summary='Remove a job',
+    description=(
+        'Permanently removes a job from the queue regardless of its current status. '
+        'Use this to clean up stuck `active` jobs after a worker crash. '
+        'Use queue aliases: `input`, `output`, `errors`.'
+    ),
+    tags=['Queue'],
+)
+def remove_job(request, queue_name: str, job_id: str):
+    resolved = QUEUE_ALIASES.get(queue_name, lambda: queue_name)()
+    try:
+        result = asyncio.run(_job_action(resolved, job_id, 'remove'))
+        logger.info('[JOB_REMOVE] queue=%s job_id=%s', resolved, job_id)
+        return 200, result
+    except ValueError as exc:
+        return 404, ErrorResponse(error='not_found', message=str(exc))
+    except Exception as exc:
+        logger.exception('[JOB_REMOVE_ERROR] queue=%s job_id=%s', resolved, job_id)
+        return 500, ErrorResponse(error='remove_error', message=str(exc))
