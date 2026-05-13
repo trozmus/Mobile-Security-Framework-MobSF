@@ -331,9 +331,13 @@ def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str, checksum: str) -> str |
             Body=pdf_bytes,
             ContentType='application/pdf',
         )
-        s3_uri = f's3://{bucket}/{pdf_key}'
-        logger.info('[PDF_UPLOAD_OK] %s size=%d bytes', s3_uri, len(pdf_bytes))
-        return s3_uri
+        public_bucket = bucket.replace(
+            'mudita-appstore-storage-dev-private',
+            'mudita-appstore-storage-dev-public',
+        )
+        pdf_url = f'https://{public_bucket}.s3.{region}.amazonaws.com/{pdf_key}'
+        logger.info('[PDF_UPLOAD_OK] %s size=%d bytes', pdf_url, len(pdf_bytes))
+        return pdf_url
     except Exception as e:
         logger.error('[PDF_UPLOAD_FAIL] bucket=%s key=%s error=%s: %s',
                      bucket, pdf_key, type(e).__name__, e)
@@ -557,6 +561,106 @@ async def _process_job(job, token):
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Stalled job recovery
+# ---------------------------------------------------------------------------
+
+_STALL_THRESHOLD_S = int(os.getenv('BULLMQ_STALL_THRESHOLD_S', 10 * 60))  # 10 min default
+
+
+async def _recover_stalled_jobs(input_queue: str, conn) -> None:
+    """At worker startup, retry active jobs that are no longer making progress.
+
+    A job is considered stalled when:
+    - its appScanExecutionId has no checksum mapping in Redis (scan never started), or
+    - the last SCAN_LOG entry is older than BULLMQ_STALL_THRESHOLD_S seconds.
+    """
+    from datetime import datetime, timezone as tz
+    from bullmq import Queue as BullQueue
+    from mobsf.MobSF.utils import get_scan_logs
+
+    q = BullQueue(input_queue, {'connection': conn})
+    try:
+        active_jobs = await q.getActive()
+        if not active_jobs:
+            logger.info('[RECOVER] No active jobs found at startup')
+            return
+
+        logger.info('[RECOVER] Found %d active job(s) — checking for stalls', len(active_jobs))
+
+        r = None
+        try:
+            r = redis.Redis(
+                host=os.getenv('VALKEY_HOST', 'localhost'),
+                port=int(os.getenv('VALKEY_PORT', '6379')),
+                username=os.getenv('VALKEY_USERNAME', 'default'),
+                password=get_memorydb_auth_token(),
+                decode_responses=True,
+                **({'ssl': True, 'ssl_cert_reqs': None} if should_use_iam_auth() else {}),
+            )
+        except Exception as e:
+            logger.warning('[RECOVER] Cannot connect to Redis for stall check: %s', e)
+
+        now = datetime.now(tz.utc)
+
+        for job in active_jobs:
+            job_data = (job.data or {}).get('jobData', job.data or {})
+            exec_id = job_data.get('appScanExecutionId')
+            process_id = job_data.get('appProcessId')
+
+            checksum = None
+            if r and exec_id:
+                checksum = r.get(f'mobsf:scan_exec:{exec_id}')
+            if r and not checksum and process_id:
+                checksum = r.get(f'mobsf:scan_proc:{process_id}')
+
+            stalled = False
+            reason = ''
+
+            if not checksum:
+                stalled = True
+                reason = 'no checksum mapping in Redis (scan never started)'
+            else:
+                logs = get_scan_logs(checksum)
+                if not logs:
+                    stalled = True
+                    reason = f'checksum={checksum} but no scan logs in DB'
+                else:
+                    last_ts_str = logs[-1].get('timestamp', '')
+                    try:
+                        last_ts = datetime.strptime(last_ts_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=tz.utc)
+                        age_s = (now - last_ts).total_seconds()
+                        if age_s > _STALL_THRESHOLD_S:
+                            stalled = True
+                            reason = f'last log {int(age_s)}s ago (threshold={_STALL_THRESHOLD_S}s)'
+                        else:
+                            logger.info('[RECOVER] job=%s is active and progressing (last log %ds ago)',
+                                        job.id, int(age_s))
+                    except ValueError:
+                        stalled = True
+                        reason = f'cannot parse last log timestamp: {last_ts_str!r}'
+
+            if stalled:
+                try:
+                    await job.retry()
+                    logger.warning('[RECOVER] job=%s appProcessId=%s retried — %s',
+                                   job.id, process_id, reason)
+                except Exception as e:
+                    logger.error('[RECOVER] job=%s retry failed: %s', job.id, e)
+
+        if r:
+            try:
+                r.close()
+            except Exception:
+                pass
+    finally:
+        try:
+            await q.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Worker lifecycle
 # ---------------------------------------------------------------------------
 
@@ -579,6 +683,8 @@ async def _run_worker():
         if not ping_ok:
             logger.error('[WORKER_START] Redis unreachable, aborting')
             return True
+
+        await _recover_stalled_jobs(input_queue, conn)
 
         # lockDuration 45 min — longer than worst-case scan time (~30 min).
         # maxStalledCount 0 — never auto-move stalled jobs to completed/failed,
