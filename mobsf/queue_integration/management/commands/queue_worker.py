@@ -34,7 +34,7 @@ import requests
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
-from bullmq import Queue, Worker
+from bullmq import Job, Queue, Worker
 
 from mobsf.queue_integration.aws_auth import (
     get_memorydb_auth_token,
@@ -576,10 +576,9 @@ async def _recover_stalled_jobs(input_queue: str, conn) -> None:
     - the last SCAN_LOG entry is older than BULLMQ_STALL_THRESHOLD_S seconds.
     """
     from datetime import datetime, timezone as tz
-    from bullmq import Queue as BullQueue
     from mobsf.MobSF.utils import get_scan_logs
 
-    q = BullQueue(input_queue, {'connection': conn})
+    q = Queue(input_queue, {'connection': conn})
     try:
         # bullmq's getActive() uses list.reverse() which returns None in Python → TypeError in cluster mode.
         # Fetch active job IDs directly from Redis instead.
