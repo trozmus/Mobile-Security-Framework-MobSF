@@ -581,12 +581,36 @@ async def _recover_stalled_jobs(input_queue: str, conn) -> None:
 
     q = BullQueue(input_queue, {'connection': conn})
     try:
-        active_jobs = await q.getActive()
-        if not active_jobs:
+        # bullmq's getActive() uses list.reverse() which returns None in Python → TypeError in cluster mode.
+        # Fetch active job IDs directly from Redis instead.
+        queue_key_prefix = f'bull:{input_queue}'
+        active_key = f'{queue_key_prefix}:active'
+        try:
+            if isinstance(conn, redis.asyncio.RedisCluster):
+                raw_ids = await conn.lrange(active_key, 0, -1)
+            else:
+                tmp = redis.asyncio.Redis(**conn, decode_responses=True) if isinstance(conn, dict) else conn
+                raw_ids = await tmp.lrange(active_key, 0, -1)
+                if isinstance(conn, dict):
+                    await tmp.aclose()
+        except Exception as e:
+            logger.warning('[RECOVER] Cannot read active jobs from Redis: %s', e)
+            return
+
+        if not raw_ids:
             logger.info('[RECOVER] No active jobs found at startup')
             return
 
-        logger.info('[RECOVER] Found %d active job(s) — checking for stalls', len(active_jobs))
+        logger.info('[RECOVER] Found %d active job(s) — checking for stalls', len(raw_ids))
+
+        active_jobs = []
+        for job_id in raw_ids:
+            try:
+                job = await Job.fromId(q, job_id)
+                if job:
+                    active_jobs.append(job)
+            except Exception as e:
+                logger.warning('[RECOVER] Cannot load job id=%s: %s', job_id, e)
 
         r = None
         try:
