@@ -312,6 +312,17 @@ def _generate_pdf(checksum: str) -> bytes | None:
         return None
 
 
+_S3_PRESIGN_TTL = int(os.getenv('S3_PRESIGN_TTL_S', 7 * 24 * 3600))  # 7 days default
+
+
+def _presign_s3_url(bucket: str, key: str, region: str) -> str:
+    return boto3.client('s3', region_name=region).generate_presigned_url(
+        'get_object',
+        Params={'Bucket': bucket, 'Key': key},
+        ExpiresIn=_S3_PRESIGN_TTL,
+    )
+
+
 def _upload_report_to_s3(report: dict, source_url: str) -> str | None:
     import json as _json
     s3_loc = _parse_s3_url(source_url)
@@ -324,29 +335,26 @@ def _upload_report_to_s3(report: dict, source_url: str) -> str | None:
     report_key = f'{apk_dir}/{report_filename}' if apk_dir else report_filename
     region = os.getenv('AWS_REGION', 'eu-central-1')
 
-    public_bucket = bucket.replace(
-        'mudita-appstore-storage-dev-private',
-        'mudita-appstore-storage-dev-public',
-    )
-    logger.info('[REPORT_UPLOAD] s3://%s/%s', public_bucket, report_key)
+    logger.info('[REPORT_UPLOAD] s3://%s/%s', bucket, report_key)
     try:
         body = _json.dumps(report, default=str).encode('utf-8')
         boto3.client('s3', region_name=region).put_object(
-            Bucket=public_bucket,
+            Bucket=bucket,
             Key=report_key,
             Body=body,
             ContentType='application/json',
         )
-        report_url = f'https://{public_bucket}.s3.{region}.amazonaws.com/{report_key}'
-        logger.info('[REPORT_UPLOAD_OK] %s size=%d bytes', report_url, len(body))
+        report_url = _presign_s3_url(bucket, report_key, region)
+        logger.info('[REPORT_UPLOAD_OK] s3://%s/%s size=%d bytes ttl=%ds',
+                    bucket, report_key, len(body), _S3_PRESIGN_TTL)
         return report_url
     except Exception as e:
         logger.error('[REPORT_UPLOAD_FAIL] bucket=%s key=%s error=%s: %s',
-                     public_bucket, report_key, type(e).__name__, e)
+                     bucket, report_key, type(e).__name__, e)
         return None
 
 
-def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str, checksum: str) -> str | None:
+def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str) -> str | None:
     s3_loc = _parse_s3_url(source_url)
     if not s3_loc:
         return None
@@ -357,24 +365,21 @@ def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str, checksum: str) -> str |
     pdf_key = f'{apk_dir}/{pdf_filename}' if apk_dir else pdf_filename
     region = os.getenv('AWS_REGION', 'eu-central-1')
 
-    public_bucket = bucket.replace(
-        'mudita-appstore-storage-dev-private',
-        'mudita-appstore-storage-dev-public',
-    )
-    logger.info('[PDF_UPLOAD] s3://%s/%s', public_bucket, pdf_key)
+    logger.info('[PDF_UPLOAD] s3://%s/%s', bucket, pdf_key)
     try:
         boto3.client('s3', region_name=region).put_object(
-            Bucket=public_bucket,
+            Bucket=bucket,
             Key=pdf_key,
             Body=pdf_bytes,
             ContentType='application/pdf',
         )
-        pdf_url = f'https://{public_bucket}.s3.{region}.amazonaws.com/{pdf_key}'
-        logger.info('[PDF_UPLOAD_OK] %s size=%d bytes', pdf_url, len(pdf_bytes))
+        pdf_url = _presign_s3_url(bucket, pdf_key, region)
+        logger.info('[PDF_UPLOAD_OK] s3://%s/%s size=%d bytes ttl=%ds',
+                    bucket, pdf_key, len(pdf_bytes), _S3_PRESIGN_TTL)
         return pdf_url
     except Exception as e:
         logger.error('[PDF_UPLOAD_FAIL] bucket=%s key=%s error=%s: %s',
-                     public_bucket, pdf_key, type(e).__name__, e)
+                     bucket, pdf_key, type(e).__name__, e)
         return None
 
 
@@ -588,7 +593,7 @@ async def _process_job(job, token):
     pdf_bytes = await loop.run_in_executor(None, _generate_pdf, checksum)
     pdf_s3_uri = None
     if pdf_bytes:
-        pdf_s3_uri = await loop.run_in_executor(None, _upload_pdf_to_s3, pdf_bytes, url, checksum)
+        pdf_s3_uri = await loop.run_in_executor(None, _upload_pdf_to_s3, pdf_bytes, url)
     else:
         logger.warning('[JOB_PDF_SKIP] id=%s PDF generation failed or skipped', job.id)
     await _extend_lock(job, token)

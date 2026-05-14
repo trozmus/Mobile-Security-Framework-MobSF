@@ -162,9 +162,10 @@ except ImportError:
     AWS_AUTH_AVAILABLE = False
 
 if (os.environ.get('POSTGRES_USER')
+        and os.environ.get('POSTGRES_HOST')
         and (os.environ.get('POSTGRES_PASSWORD')
-             or os.environ.get('POSTGRES_PASSWORD_FILE'))
-        and os.environ.get('POSTGRES_HOST')):
+             or os.environ.get('POSTGRES_PASSWORD_FILE')
+             or (AWS_AUTH_AVAILABLE and should_use_iam_auth()))):
     # Postgres support
     default = {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
