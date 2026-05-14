@@ -422,9 +422,10 @@ def _run_static_scan(
 # Publish result
 # ---------------------------------------------------------------------------
 
-async def _publish(payload: dict, job_name: str, max_retries: int = 2) -> None:
-    is_error = payload.get('status') == 'FAILED'
-    queue_name = _get_errors_queue() if is_error else _get_output_queue()
+async def _publish(payload: dict, job_name: str, max_retries: int = 2, queue_name: str = None) -> None:
+    if queue_name is None:
+        is_error = payload.get('status') == 'FAILED'
+        queue_name = _get_errors_queue() if is_error else _get_output_queue()
 
     last_error = None
     for attempt in range(max_retries):
@@ -502,6 +503,12 @@ async def _process_job(job, token):
 
     logger.info('[JOB_START] id=%s appProcessId=%s processType=%s url=%s',
                 job.id, process_id, process_type, url)
+
+    await _publish({
+        'appProcessId': process_id,
+        'appScanExecutionId': scan_execution_id,
+        'status': 'IN_PROGRESS',
+    }, job_name='app-binary-scan-result-processing', queue_name=_get_output_queue())
 
     loop = asyncio.get_event_loop()
 
