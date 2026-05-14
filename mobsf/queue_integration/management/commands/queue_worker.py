@@ -324,25 +324,25 @@ def _upload_report_to_s3(report: dict, source_url: str) -> str | None:
     report_key = f'{apk_dir}/{report_filename}' if apk_dir else report_filename
     region = os.getenv('AWS_REGION', 'eu-central-1')
 
-    logger.info('[REPORT_UPLOAD] s3://%s/%s', bucket, report_key)
+    public_bucket = bucket.replace(
+        'mudita-appstore-storage-dev-private',
+        'mudita-appstore-storage-dev-public',
+    )
+    logger.info('[REPORT_UPLOAD] s3://%s/%s', public_bucket, report_key)
     try:
         body = _json.dumps(report, default=str).encode('utf-8')
         boto3.client('s3', region_name=region).put_object(
-            Bucket=bucket,
+            Bucket=public_bucket,
             Key=report_key,
             Body=body,
             ContentType='application/json',
-        )
-        public_bucket = bucket.replace(
-            'mudita-appstore-storage-dev-private',
-            'mudita-appstore-storage-dev-public',
         )
         report_url = f'https://{public_bucket}.s3.{region}.amazonaws.com/{report_key}'
         logger.info('[REPORT_UPLOAD_OK] %s size=%d bytes', report_url, len(body))
         return report_url
     except Exception as e:
         logger.error('[REPORT_UPLOAD_FAIL] bucket=%s key=%s error=%s: %s',
-                     bucket, report_key, type(e).__name__, e)
+                     public_bucket, report_key, type(e).__name__, e)
         return None
 
 
@@ -357,24 +357,24 @@ def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str, checksum: str) -> str |
     pdf_key = f'{apk_dir}/{pdf_filename}' if apk_dir else pdf_filename
     region = os.getenv('AWS_REGION', 'eu-central-1')
 
-    logger.info('[PDF_UPLOAD] s3://%s/%s', bucket, pdf_key)
+    public_bucket = bucket.replace(
+        'mudita-appstore-storage-dev-private',
+        'mudita-appstore-storage-dev-public',
+    )
+    logger.info('[PDF_UPLOAD] s3://%s/%s', public_bucket, pdf_key)
     try:
         boto3.client('s3', region_name=region).put_object(
-            Bucket=bucket,
+            Bucket=public_bucket,
             Key=pdf_key,
             Body=pdf_bytes,
             ContentType='application/pdf',
-        )
-        public_bucket = bucket.replace(
-            'mudita-appstore-storage-dev-private',
-            'mudita-appstore-storage-dev-public',
         )
         pdf_url = f'https://{public_bucket}.s3.{region}.amazonaws.com/{pdf_key}'
         logger.info('[PDF_UPLOAD_OK] %s size=%d bytes', pdf_url, len(pdf_bytes))
         return pdf_url
     except Exception as e:
         logger.error('[PDF_UPLOAD_FAIL] bucket=%s key=%s error=%s: %s',
-                     bucket, pdf_key, type(e).__name__, e)
+                     public_bucket, pdf_key, type(e).__name__, e)
         return None
 
 
