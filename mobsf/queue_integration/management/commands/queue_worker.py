@@ -277,6 +277,14 @@ def _generate_pdf(checksum: str) -> bytes | None:
         context['dwd_dir'] = proto + settings.DWD_DIR
         context['host_os'] = 'windows' if platform.system() == 'Windows' else 'nix'
 
+        # Clear icon_path if the file doesn't exist on disk to avoid wkhtmltopdf ContentNotFoundError
+        icon_path = context.get('icon_path', '')
+        if icon_path:
+            icon_full = os.path.join(settings.DWD_DIR, icon_path)
+            if not os.path.isfile(icon_full):
+                logger.debug('[PDF_GEN] icon not found on disk, clearing icon_path: %s', icon_full)
+                context['icon_path'] = ''
+
         try:
             context['timestamp'] = RecentScansDB.objects.get(MD5=checksum).TIMESTAMP
         except RecentScansDB.DoesNotExist:
