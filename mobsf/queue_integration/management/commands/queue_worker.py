@@ -295,6 +295,8 @@ def _generate_pdf(checksum: str) -> bytes | None:
             'orientation': 'Landscape',
             'custom-header': [('Accept-Encoding', 'gzip')],
             'no-outline': None,
+            'load-error-handling': 'ignore',
+            'load-media-error-handling': 'ignore',
         }
         proxies, _ = upstream_proxy('https')
         if proxies.get('https'):
