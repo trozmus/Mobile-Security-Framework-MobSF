@@ -178,18 +178,28 @@ if (os.environ.get('POSTGRES_USER')
     # Determine auth method based on NODE_ENV
     if AWS_AUTH_AVAILABLE and should_use_iam_auth():
         # Production: use IAM authentication
-        default['PASSWORD'] = get_rds_auth_token()
-        default['OPTIONS'] = {
-            'sslmode': 'require',  # RDS IAM auth requires SSL
-        }
-        # Shorter connection lifetime (10 min) to refresh token before expiration (15 min)
-        default['CONN_MAX_AGE'] = 600
+        try:
+            default['PASSWORD'] = get_rds_auth_token()
+            default['OPTIONS'] = {
+                'sslmode': 'require',  # RDS IAM auth requires SSL
+            }
+            # Shorter connection lifetime (10 min) to refresh token before expiration (15 min)
+            default['CONN_MAX_AGE'] = 600
+            print('[DB] PostgreSQL with IAM auth configured')
+        except Exception as _rds_err:
+            print(f'[DB] RDS IAM token failed, falling back to SQLite: {_rds_err}')
+            default = {
+                'ENGINE': 'django.db.backends.sqlite3',
+                'NAME': DB_DIR,
+            }
     else:
         # Local development: use password from env
         default['PASSWORD'] = get_secret_from_file_or_env('POSTGRES_PASSWORD')
         # Standard connection pooling
         default['CONN_MAX_AGE'] = 0  # Close connections at end of request
+        print('[DB] PostgreSQL with password auth configured')
 else:
+    print('[DB] SQLite configured (POSTGRES_USER or POSTGRES_HOST not set)')
     # Sqlite3 support
     default = {
         'ENGINE': 'django.db.backends.sqlite3',
