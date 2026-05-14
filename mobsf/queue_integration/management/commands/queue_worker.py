@@ -312,6 +312,40 @@ def _generate_pdf(checksum: str) -> bytes | None:
         return None
 
 
+def _upload_report_to_s3(report: dict, source_url: str) -> str | None:
+    import json as _json
+    s3_loc = _parse_s3_url(source_url)
+    if not s3_loc:
+        return None
+
+    bucket, apk_key = s3_loc
+    apk_dir = os.path.dirname(apk_key)
+    report_filename = os.path.splitext(os.path.basename(apk_key))[0] + '-report.json'
+    report_key = f'{apk_dir}/{report_filename}' if apk_dir else report_filename
+    region = os.getenv('AWS_REGION', 'eu-central-1')
+
+    logger.info('[REPORT_UPLOAD] s3://%s/%s', bucket, report_key)
+    try:
+        body = _json.dumps(report, default=str).encode('utf-8')
+        boto3.client('s3', region_name=region).put_object(
+            Bucket=bucket,
+            Key=report_key,
+            Body=body,
+            ContentType='application/json',
+        )
+        public_bucket = bucket.replace(
+            'mudita-appstore-storage-dev-private',
+            'mudita-appstore-storage-dev-public',
+        )
+        report_url = f'https://{public_bucket}.s3.{region}.amazonaws.com/{report_key}'
+        logger.info('[REPORT_UPLOAD_OK] %s size=%d bytes', report_url, len(body))
+        return report_url
+    except Exception as e:
+        logger.error('[REPORT_UPLOAD_FAIL] bucket=%s key=%s error=%s: %s',
+                     bucket, report_key, type(e).__name__, e)
+        return None
+
+
 def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str, checksum: str) -> str | None:
     s3_loc = _parse_s3_url(source_url)
     if not s3_loc:
@@ -544,6 +578,11 @@ async def _process_job(job, token):
                        job_name='app-binary-scan-result-scan-error')
         return
 
+    # --- Upload report JSON to S3 ---
+    report_url = await loop.run_in_executor(None, _upload_report_to_s3, report, url)
+    if not report_url:
+        logger.warning('[JOB_REPORT_SKIP] id=%s report upload failed or skipped (non-S3 source)', job.id)
+
     # --- Generate and upload PDF ---
     t0 = time.time()
     pdf_bytes = await loop.run_in_executor(None, _generate_pdf, checksum)
@@ -555,14 +594,14 @@ async def _process_job(job, token):
     await _extend_lock(job, token)
 
     # --- Done ---
-    logger.info('[JOB_DONE] id=%s appProcessId=%s file=%s pdf=%s total_elapsed=%.2fs',
-                job.id, process_id, filename, pdf_s3_uri or 'none', time.time() - job_start)
+    logger.info('[JOB_DONE] id=%s appProcessId=%s file=%s report=%s pdf=%s total_elapsed=%.2fs',
+                job.id, process_id, filename, report_url or 'none', pdf_s3_uri or 'none', time.time() - job_start)
     await _publish({
         'appProcessId': process_id,
         'appScanExecutionId': scan_execution_id,
         'status': 'COMPLETED',
         'fileName': filename,
-        'report': report,
+        'reportUrl': report_url,
         'pdfReportUrl': pdf_s3_uri,
     }, job_name='app-binary-scan-result-success')
 
