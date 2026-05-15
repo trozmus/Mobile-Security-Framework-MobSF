@@ -202,6 +202,14 @@ class ScanLogsResponse(Schema):
     logs: list[ScanLogEntry]
 
 
+class ActiveScanResponse(Schema):
+    jobId: str
+    appProcessId: str
+    appScanExecutionId: str | None
+    startedAt: int
+    elapsedSeconds: int
+
+
 class HealthResponse(Schema):
     status: str
     version: str
@@ -363,16 +371,26 @@ async def _push_to_queue(process_id: str, scan_execution_id: str, process_type: 
 # ---------------------------------------------------------------------------
 
 def _redis_sync_client():
-    """Return a sync redis.Redis client using current env config."""
+    """Return a sync Redis client — RedisCluster in IAM/cluster mode, Redis otherwise."""
     from mobsf.queue_integration.aws_auth import get_memorydb_auth_token, should_use_iam_auth
     host = os.getenv('VALKEY_HOST', 'localhost')
     port = int(os.getenv('VALKEY_PORT', '6379'))
     username = os.getenv('VALKEY_USERNAME', 'default')
     password = get_memorydb_auth_token()
-    opts = {'host': host, 'port': port, 'username': username, 'password': password, 'decode_responses': True}
     if should_use_iam_auth():
-        opts.update({'ssl': True, 'ssl_cert_reqs': None})
-    return redis.Redis(**opts)
+        return redis.RedisCluster(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            ssl=True,
+            ssl_cert_reqs=None,
+            ssl_check_hostname=False,
+            socket_timeout=10,
+            decode_responses=True,
+            require_full_coverage=False,
+        )
+    return redis.Redis(host=host, port=port, username=username, password=password, decode_responses=True)
 
 
 def _resolve_checksum(appScanExecutionId: str | None, appProcessId: str | None) -> str | None:
@@ -430,6 +448,41 @@ def get_scan_logs(request, appScanExecutionId: str = None, appProcessId: str = N
         for entry in raw_logs
     ]
     return 200, ScanLogsResponse(checksum=checksum, logs=logs)
+
+
+@api.get(
+    '/scan/active',
+    response={200: ActiveScanResponse, codes_4xx: ErrorResponse, codes_5xx: ErrorResponse},
+    summary='Get currently active scan',
+    description='Returns the job ID and process IDs of the scan currently being processed by the worker, or 404 if idle.',
+    tags=['Scan'],
+)
+def get_active_scan(request):
+    import json as _json
+    import time as _time
+    try:
+        r = _redis_sync_client()
+        raw = r.get('mobsf:active_scan')
+        r.close()
+    except Exception as exc:
+        logger.exception('[ACTIVE_SCAN_REDIS_ERROR]')
+        return 500, ErrorResponse(error='redis_error', message=str(exc))
+
+    if not raw:
+        return 404, ErrorResponse(error='not_found', message='No scan is currently being processed.')
+
+    try:
+        data = _json.loads(raw)
+        started_at = data.get('startedAt', 0)
+        return 200, ActiveScanResponse(
+            jobId=data['jobId'],
+            appProcessId=data['appProcessId'],
+            appScanExecutionId=data.get('appScanExecutionId'),
+            startedAt=started_at,
+            elapsedSeconds=int(_time.time()) - started_at,
+        )
+    except Exception as exc:
+        return 500, ErrorResponse(error='parse_error', message=str(exc))
 
 
 @api.get(

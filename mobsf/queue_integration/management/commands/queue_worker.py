@@ -24,6 +24,7 @@ import asyncio
 import io
 import logging
 import os
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -397,20 +398,60 @@ def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str) -> str | None:
 # Static scan
 # ---------------------------------------------------------------------------
 
+def _redis_worker_client():
+    """Return a sync Redis client — RedisCluster in IAM/cluster mode, Redis otherwise."""
+    host = os.getenv('VALKEY_HOST', 'localhost')
+    port = int(os.getenv('VALKEY_PORT', '6379'))
+    username = os.getenv('VALKEY_USERNAME', 'default')
+    from mobsf.queue_integration.aws_auth import get_memorydb_auth_token, should_use_iam_auth
+    password = get_memorydb_auth_token()
+    if should_use_iam_auth():
+        return redis.RedisCluster(
+            host=host, port=port,
+            username=username, password=password,
+            ssl=True, ssl_cert_reqs=None, ssl_check_hostname=False,
+            socket_timeout=10, decode_responses=True,
+            require_full_coverage=False,
+        )
+    return redis.Redis(host=host, port=port, username=username, password=password, decode_responses=True)
+
+
+_ACTIVE_SCAN_KEY = 'mobsf:active_scan'
+_ACTIVE_SCAN_TTL = 4 * 3600  # 4h safety TTL in case of crash
+
+
+def _set_active_scan(job_id: str, process_id: str, scan_execution_id: str | None) -> None:
+    """Mark a job as currently being processed."""
+    import json as _json
+    try:
+        r = _redis_worker_client()
+        r.setex(_ACTIVE_SCAN_KEY, _ACTIVE_SCAN_TTL, _json.dumps({
+            'jobId': job_id,
+            'appProcessId': process_id,
+            'appScanExecutionId': scan_execution_id,
+            'startedAt': int(time.time()),
+        }))
+        r.close()
+    except Exception as e:
+        logger.warning('[ACTIVE_SCAN_SET_FAIL] %s', e)
+
+
+def _clear_active_scan() -> None:
+    """Remove the active scan marker."""
+    try:
+        r = _redis_worker_client()
+        r.delete(_ACTIVE_SCAN_KEY)
+        r.close()
+    except Exception as e:
+        logger.warning('[ACTIVE_SCAN_CLEAR_FAIL] %s', e)
+
+
 def _store_scan_mapping(scan_execution_id: str | None, process_id: str | None, checksum: str) -> None:
     """Store appScanExecutionId/appProcessId → checksum mapping in Redis for scan log lookups."""
     if not scan_execution_id and not process_id:
         return
     try:
-        host = os.getenv('VALKEY_HOST', 'localhost')
-        port = int(os.getenv('VALKEY_PORT', '6379'))
-        username = os.getenv('VALKEY_USERNAME', 'default')
-        from mobsf.queue_integration.aws_auth import get_memorydb_auth_token, should_use_iam_auth
-        password = get_memorydb_auth_token()
-        opts = {'host': host, 'port': port, 'username': username, 'password': password, 'decode_responses': True}
-        if should_use_iam_auth():
-            opts.update({'ssl': True, 'ssl_cert_reqs': None})
-        r = redis.Redis(**opts)
+        r = _redis_worker_client()
         ttl = 7 * 24 * 3600
         if scan_execution_id:
             r.setex(f'mobsf:scan_exec:{scan_execution_id}', ttl, checksum)
@@ -552,6 +593,7 @@ async def _process_job(job, token):
 
     logger.info('[JOB_START] id=%s appProcessId=%s processType=%s url=%s',
                 job.id, process_id, process_type, url)
+    _set_active_scan(job.id, process_id, scan_execution_id)
 
     await _publish({
         'appProcessId': process_id,
@@ -571,6 +613,7 @@ async def _process_job(job, token):
     except Exception as exc:
         logger.error('[JOB_DOWNLOAD_FAIL] id=%s appProcessId=%s elapsed=%.2fs error=%s: %s',
                      job.id, process_id, time.time() - t0, type(exc).__name__, exc)
+        _clear_active_scan()
         await _publish({'appProcessId': process_id, 'appScanExecutionId': scan_execution_id,
                         'status': 'FAILED', 'error': 'download_failed', 'message': str(exc)},
                        job_name='app-binary-scan-result-download-error')
@@ -588,6 +631,7 @@ async def _process_job(job, token):
     except Exception as exc:
         logger.error('[JOB_SCAN_FAIL] id=%s appProcessId=%s file=%s elapsed=%.2fs error=%s: %s',
                      job.id, process_id, filename, time.time() - t0, type(exc).__name__, exc)
+        _clear_active_scan()
         await _publish({'appProcessId': process_id, 'appScanExecutionId': scan_execution_id,
                         'status': 'FAILED', 'error': 'scan_failed', 'message': str(exc), 'fileName': filename},
                        job_name='app-binary-scan-result-scan-error')
@@ -609,6 +653,7 @@ async def _process_job(job, token):
     await _extend_lock(job, token)
 
     # --- Done ---
+    _clear_active_scan()
     logger.info('[JOB_DONE] id=%s appProcessId=%s file=%s report=%s pdf=%s total_elapsed=%.2fs',
                 job.id, process_id, filename, report_url or 'none', pdf_s3_uri or 'none', time.time() - job_start)
     await _publish({
@@ -676,14 +721,7 @@ async def _recover_stalled_jobs(input_queue: str, conn) -> None:
 
         r = None
         try:
-            r = redis.Redis(
-                host=os.getenv('VALKEY_HOST', 'localhost'),
-                port=int(os.getenv('VALKEY_PORT', '6379')),
-                username=os.getenv('VALKEY_USERNAME', 'default'),
-                password=get_memorydb_auth_token(),
-                decode_responses=True,
-                **({'ssl': True, 'ssl_cert_reqs': None} if should_use_iam_auth() else {}),
-            )
+            r = _redis_worker_client()
         except Exception as e:
             logger.warning('[RECOVER] Cannot connect to Redis for stall check: %s', e)
 
