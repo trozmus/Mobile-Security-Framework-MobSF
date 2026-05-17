@@ -185,9 +185,11 @@ if (os.environ.get('POSTGRES_USER')
             }
             # Shorter connection lifetime (10 min) to refresh token before expiration (15 min)
             default['CONN_MAX_AGE'] = 600
-            print('[DB] PostgreSQL with IAM auth configured')
+            import sys
+            print('[DB] PostgreSQL with IAM auth configured', file=sys.stderr, flush=True)
         except Exception as _rds_err:
-            print(f'[DB] RDS IAM token failed, falling back to SQLite: {_rds_err}')
+            import sys
+            print(f'[DB] RDS IAM token failed, falling back to SQLite: {_rds_err}', file=sys.stderr, flush=True)
             default = {
                 'ENGINE': 'django.db.backends.sqlite3',
                 'NAME': DB_DIR,
@@ -197,9 +199,11 @@ if (os.environ.get('POSTGRES_USER')
         default['PASSWORD'] = get_secret_from_file_or_env('POSTGRES_PASSWORD')
         # Standard connection pooling
         default['CONN_MAX_AGE'] = 0  # Close connections at end of request
-        print('[DB] PostgreSQL with password auth configured')
+        import sys
+        print('[DB] PostgreSQL with password auth configured', file=sys.stderr, flush=True)
 else:
-    print('[DB] SQLite configured (POSTGRES_USER or POSTGRES_HOST not set)')
+    import sys
+    print('[DB] SQLite configured (POSTGRES_USER or POSTGRES_HOST not set)', file=sys.stderr, flush=True)
     # Sqlite3 support
     default = {
         'ENGINE': 'django.db.backends.sqlite3',
