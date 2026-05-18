@@ -610,7 +610,9 @@ def get_queue_stats(request):
         os.getenv('QUEUE_ERRORS', '{app-scanner-errors}'),
     ]
     try:
-        stats = asyncio.run(asyncio.gather(*[_get_queue_stats(q) for q in queue_names]))
+        async def _gather():
+            return await asyncio.gather(*[_get_queue_stats(q) for q in queue_names])
+        stats = asyncio.run(_gather())
         return 200, QueueStatsResponse(queues=list(stats))
     except Exception as exc:
         logger.exception('[STATS_ERROR]')
