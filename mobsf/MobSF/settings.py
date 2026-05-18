@@ -179,14 +179,15 @@ if (os.environ.get('POSTGRES_USER')
     if AWS_AUTH_AVAILABLE and should_use_iam_auth():
         # Production: use IAM authentication
         try:
+            default['ENGINE'] = 'mobsf.MobSF.db_backend'
             default['PASSWORD'] = get_rds_auth_token()
             default['OPTIONS'] = {
                 'sslmode': 'require',  # RDS IAM auth requires SSL
             }
-            # Shorter connection lifetime (10 min) to refresh token before expiration (15 min)
-            default['CONN_MAX_AGE'] = 600
+            # Token valid 15 min — close connections before expiry so next open gets fresh token
+            default['CONN_MAX_AGE'] = 0
             import sys
-            print('[DB] PostgreSQL with IAM auth configured', file=sys.stderr, flush=True)
+            print('[DB] PostgreSQL with IAM auth configured (token-refresh backend)', file=sys.stderr, flush=True)
         except Exception as _rds_err:
             import sys
             print(f'[DB] RDS IAM token failed, falling back to SQLite: {_rds_err}', file=sys.stderr, flush=True)
