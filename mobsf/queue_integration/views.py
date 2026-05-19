@@ -502,6 +502,30 @@ def health_check(request):
     )
 
 
+class ClearCacheResponse(Schema):
+    deleted_scans: int
+    deleted_results: int
+
+
+@api.delete(
+    '/scans/cache',
+    response={200: ClearCacheResponse, codes_5xx: ErrorResponse},
+    summary='Clear scan cache',
+    description='Deletes all entries from RecentScansDB and StaticAnalyzerAndroid so every application is re-scanned from scratch.',
+    tags=['Scans'],
+)
+def clear_scan_cache(request):
+    try:
+        from mobsf.StaticAnalyzer.models import RecentScansDB, StaticAnalyzerAndroid
+        deleted_scans, _ = RecentScansDB.objects.all().delete()
+        deleted_results, _ = StaticAnalyzerAndroid.objects.all().delete()
+        logger.info('[CACHE_CLEAR] deleted_scans=%d deleted_results=%d', deleted_scans, deleted_results)
+        return 200, ClearCacheResponse(deleted_scans=deleted_scans, deleted_results=deleted_results)
+    except Exception as exc:
+        logger.exception('[CACHE_CLEAR_ERROR]')
+        return 500, ErrorResponse(error='cache_clear_error', message=str(exc))
+
+
 @api.post(
     '/push',
     response={200: ScanJobQueued, codes_4xx: ErrorResponse, codes_5xx: ErrorResponse},
