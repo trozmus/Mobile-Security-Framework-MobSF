@@ -190,11 +190,10 @@ if (os.environ.get('POSTGRES_USER')
             print('[DB] PostgreSQL with IAM auth configured (token-refresh backend)', file=sys.stderr, flush=True)
         except Exception as _rds_err:
             import sys
-            print(f'[DB] RDS IAM token failed, falling back to SQLite: {_rds_err}', file=sys.stderr, flush=True)
-            default = {
-                'ENGINE': 'django.db.backends.sqlite3',
-                'NAME': DB_DIR,
-            }
+            print(f'[DB] RDS IAM token failed: {_rds_err}', file=sys.stderr, flush=True)
+            raise RuntimeError(
+                f'RDS IAM auth required (NODE_ENV={os.getenv("NODE_ENV")}) but token generation failed: {_rds_err}'
+            ) from _rds_err
     else:
         # Local development: use password from env
         default['PASSWORD'] = get_secret_from_file_or_env('POSTGRES_PASSWORD')
