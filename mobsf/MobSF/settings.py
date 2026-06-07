@@ -162,9 +162,10 @@ except ImportError:
     AWS_AUTH_AVAILABLE = False
 
 if (os.environ.get('POSTGRES_USER')
+        and os.environ.get('POSTGRES_HOST')
         and (os.environ.get('POSTGRES_PASSWORD')
-             or os.environ.get('POSTGRES_PASSWORD_FILE'))
-        and os.environ.get('POSTGRES_HOST')):
+             or os.environ.get('POSTGRES_PASSWORD_FILE')
+             or (AWS_AUTH_AVAILABLE and should_use_iam_auth()))):
     # Postgres support
     default = {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
@@ -177,18 +178,32 @@ if (os.environ.get('POSTGRES_USER')
     # Determine auth method based on NODE_ENV
     if AWS_AUTH_AVAILABLE and should_use_iam_auth():
         # Production: use IAM authentication
-        default['PASSWORD'] = get_rds_auth_token()
-        default['OPTIONS'] = {
-            'sslmode': 'require',  # RDS IAM auth requires SSL
-        }
-        # Shorter connection lifetime (10 min) to refresh token before expiration (15 min)
-        default['CONN_MAX_AGE'] = 600
+        try:
+            default['ENGINE'] = 'mobsf.MobSF.db_backend'
+            default['PASSWORD'] = get_rds_auth_token()
+            default['OPTIONS'] = {
+                'sslmode': 'require',  # RDS IAM auth requires SSL
+            }
+            # Token valid 15 min — close connections before expiry so next open gets fresh token
+            default['CONN_MAX_AGE'] = 0
+            import sys
+            print('[DB] PostgreSQL with IAM auth configured (token-refresh backend)', file=sys.stderr, flush=True)
+        except Exception as _rds_err:
+            import sys
+            print(f'[DB] RDS IAM token failed: {_rds_err}', file=sys.stderr, flush=True)
+            raise RuntimeError(
+                f'RDS IAM auth required (NODE_ENV={os.getenv("NODE_ENV")}) but token generation failed: {_rds_err}'
+            ) from _rds_err
     else:
         # Local development: use password from env
         default['PASSWORD'] = get_secret_from_file_or_env('POSTGRES_PASSWORD')
         # Standard connection pooling
         default['CONN_MAX_AGE'] = 0  # Close connections at end of request
+        import sys
+        print('[DB] PostgreSQL with password auth configured', file=sys.stderr, flush=True)
 else:
+    import sys
+    print('[DB] SQLite configured (POSTGRES_USER or POSTGRES_HOST not set)', file=sys.stderr, flush=True)
     # Sqlite3 support
     default = {
         'ENGINE': 'django.db.backends.sqlite3',

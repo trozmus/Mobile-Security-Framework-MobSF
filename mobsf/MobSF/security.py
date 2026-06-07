@@ -112,6 +112,7 @@ def get_executable_hashes():
         'idevicename',
         'pkill',
         'iproxy',
+        'nice',
     ]
     for sbin in system_bins:
         bin_path = which(sbin)

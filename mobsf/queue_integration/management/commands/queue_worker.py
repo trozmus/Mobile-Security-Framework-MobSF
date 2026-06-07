@@ -24,6 +24,7 @@ import asyncio
 import io
 import logging
 import os
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -34,7 +35,7 @@ import requests
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
-from bullmq import Queue, Worker
+from bullmq import Job, Queue, Worker
 
 from mobsf.queue_integration.aws_auth import (
     get_memorydb_auth_token,
@@ -277,6 +278,14 @@ def _generate_pdf(checksum: str) -> bytes | None:
         context['dwd_dir'] = proto + settings.DWD_DIR
         context['host_os'] = 'windows' if platform.system() == 'Windows' else 'nix'
 
+        # Clear icon_path if the file doesn't exist on disk to avoid wkhtmltopdf ContentNotFoundError
+        icon_path = context.get('icon_path', '')
+        if icon_path:
+            icon_full = os.path.join(settings.DWD_DIR, icon_path)
+            if not os.path.isfile(icon_full):
+                logger.debug('[PDF_GEN] icon not found on disk, clearing icon_path: %s', icon_full)
+                context['icon_path'] = ''
+
         try:
             context['timestamp'] = RecentScansDB.objects.get(MD5=checksum).TIMESTAMP
         except RecentScansDB.DoesNotExist:
@@ -295,6 +304,8 @@ def _generate_pdf(checksum: str) -> bytes | None:
             'orientation': 'Landscape',
             'custom-header': [('Accept-Encoding', 'gzip')],
             'no-outline': None,
+            'load-error-handling': 'ignore',
+            'load-media-error-handling': 'ignore',
         }
         proxies, _ = upstream_proxy('https')
         if proxies.get('https'):
@@ -312,7 +323,49 @@ def _generate_pdf(checksum: str) -> bytes | None:
         return None
 
 
-def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str, checksum: str) -> str | None:
+_S3_PRESIGN_TTL = int(os.getenv('S3_PRESIGN_TTL_S', 7 * 24 * 3600))  # 7 days default
+
+
+def _presign_s3_url(bucket: str, key: str, region: str) -> str:
+    return boto3.client('s3', region_name=region).generate_presigned_url(
+        'get_object',
+        Params={'Bucket': bucket, 'Key': key},
+        ExpiresIn=_S3_PRESIGN_TTL,
+    )
+
+
+def _upload_report_to_s3(report: dict, source_url: str) -> str | None:
+    import json as _json
+    s3_loc = _parse_s3_url(source_url)
+    if not s3_loc:
+        return None
+
+    bucket, apk_key = s3_loc
+    apk_dir = os.path.dirname(apk_key)
+    report_filename = os.path.splitext(os.path.basename(apk_key))[0] + '-report.json'
+    report_key = f'{apk_dir}/{report_filename}' if apk_dir else report_filename
+    region = os.getenv('AWS_REGION', 'eu-central-1')
+
+    logger.info('[REPORT_UPLOAD] s3://%s/%s', bucket, report_key)
+    try:
+        body = _json.dumps(report, default=str).encode('utf-8')
+        boto3.client('s3', region_name=region).put_object(
+            Bucket=bucket,
+            Key=report_key,
+            Body=body,
+            ContentType='application/json',
+        )
+        report_url = _presign_s3_url(bucket, report_key, region)
+        logger.info('[REPORT_UPLOAD_OK] s3://%s/%s size=%d bytes ttl=%ds',
+                    bucket, report_key, len(body), _S3_PRESIGN_TTL)
+        return report_url
+    except Exception as e:
+        logger.error('[REPORT_UPLOAD_FAIL] bucket=%s key=%s error=%s: %s',
+                     bucket, report_key, type(e).__name__, e)
+        return None
+
+
+def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str) -> str | None:
     s3_loc = _parse_s3_url(source_url)
     if not s3_loc:
         return None
@@ -331,9 +384,10 @@ def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str, checksum: str) -> str |
             Body=pdf_bytes,
             ContentType='application/pdf',
         )
-        s3_uri = f's3://{bucket}/{pdf_key}'
-        logger.info('[PDF_UPLOAD_OK] %s size=%d bytes', s3_uri, len(pdf_bytes))
-        return s3_uri
+        pdf_url = _presign_s3_url(bucket, pdf_key, region)
+        logger.info('[PDF_UPLOAD_OK] s3://%s/%s size=%d bytes ttl=%ds',
+                    bucket, pdf_key, len(pdf_bytes), _S3_PRESIGN_TTL)
+        return pdf_url
     except Exception as e:
         logger.error('[PDF_UPLOAD_FAIL] bucket=%s key=%s error=%s: %s',
                      bucket, pdf_key, type(e).__name__, e)
@@ -344,9 +398,80 @@ def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str, checksum: str) -> str |
 # Static scan
 # ---------------------------------------------------------------------------
 
-def _run_static_scan(filename: str, apk_bytes: bytes) -> tuple[str, dict]:
+def _redis_worker_client():
+    """Return a sync Redis client — RedisCluster in IAM/cluster mode, Redis otherwise."""
+    host = os.getenv('VALKEY_HOST', 'localhost')
+    port = int(os.getenv('VALKEY_PORT', '6379'))
+    username = os.getenv('VALKEY_USERNAME', 'default')
+    from mobsf.queue_integration.aws_auth import get_memorydb_auth_token, should_use_iam_auth
+    password = get_memorydb_auth_token()
+    if should_use_iam_auth():
+        return redis.RedisCluster(
+            host=host, port=port,
+            username=username, password=password,
+            ssl=True, ssl_cert_reqs=None, ssl_check_hostname=False,
+            socket_timeout=10, decode_responses=True,
+            require_full_coverage=False,
+        )
+    return redis.Redis(host=host, port=port, username=username, password=password, decode_responses=True)
+
+
+_ACTIVE_SCAN_KEY = 'mobsf:active_scan'
+_ACTIVE_SCAN_TTL = 4 * 3600  # 4h safety TTL in case of crash
+
+
+def _set_active_scan(job_id: str, process_id: str, scan_execution_id: str | None) -> None:
+    """Mark a job as currently being processed."""
+    import json as _json
+    try:
+        r = _redis_worker_client()
+        r.setex(_ACTIVE_SCAN_KEY, _ACTIVE_SCAN_TTL, _json.dumps({
+            'jobId': job_id,
+            'appProcessId': process_id,
+            'appScanExecutionId': scan_execution_id,
+            'startedAt': int(time.time()),
+        }))
+        r.close()
+    except Exception as e:
+        logger.warning('[ACTIVE_SCAN_SET_FAIL] %s', e)
+
+
+def _clear_active_scan() -> None:
+    """Remove the active scan marker."""
+    try:
+        r = _redis_worker_client()
+        r.delete(_ACTIVE_SCAN_KEY)
+        r.close()
+    except Exception as e:
+        logger.warning('[ACTIVE_SCAN_CLEAR_FAIL] %s', e)
+
+
+def _store_scan_mapping(scan_execution_id: str | None, process_id: str | None, checksum: str) -> None:
+    """Store appScanExecutionId/appProcessId → checksum mapping in Redis for scan log lookups."""
+    if not scan_execution_id and not process_id:
+        return
+    try:
+        r = _redis_worker_client()
+        ttl = 7 * 24 * 3600
+        if scan_execution_id:
+            r.setex(f'mobsf:scan_exec:{scan_execution_id}', ttl, checksum)
+        if process_id:
+            r.setex(f'mobsf:scan_proc:{process_id}', ttl, checksum)
+        r.close()
+        logger.debug('[SCAN_MAP_STORED] scan_execution_id=%s process_id=%s checksum=%s',
+                     scan_execution_id, process_id, checksum)
+    except Exception as e:
+        logger.warning('[SCAN_MAP_FAIL] Could not store scan mapping: %s', e)
+
+
+def _run_static_scan(
+        filename: str, apk_bytes: bytes,
+        scan_execution_id: str | None = None,
+        process_id: str | None = None,
+) -> tuple[str, dict]:
     buf = io.BufferedReader(io.BytesIO(apk_bytes))
     checksum = handle_uploaded_file(buf, '.apk')
+    _store_scan_mapping(scan_execution_id, process_id, checksum)
 
     add_to_recent_scan({
         'analyzer': 'static_analyzer',
@@ -387,9 +512,10 @@ def _run_static_scan(filename: str, apk_bytes: bytes) -> tuple[str, dict]:
 # Publish result
 # ---------------------------------------------------------------------------
 
-async def _publish(payload: dict, job_name: str, max_retries: int = 2) -> None:
-    is_error = payload.get('status') == 'FAILED'
-    queue_name = _get_errors_queue() if is_error else _get_output_queue()
+async def _publish(payload: dict, job_name: str, max_retries: int = 2, queue_name: str = None) -> None:
+    if queue_name is None:
+        is_error = payload.get('status') == 'FAILED'
+        queue_name = _get_errors_queue() if is_error else _get_output_queue()
 
     last_error = None
     for attempt in range(max_retries):
@@ -417,6 +543,23 @@ async def _publish(payload: dict, job_name: str, max_retries: int = 2) -> None:
 
     logger.error('[PUBLISH_FAILED] Exhausted %d retries. Last error: %s', max_retries, last_error)
     raise last_error
+
+
+# ---------------------------------------------------------------------------
+# Lock renewal helper
+# ---------------------------------------------------------------------------
+
+_LOCK_DURATION_MS = int(os.getenv('BULLMQ_LOCK_DURATION_MS', 45 * 60 * 1000))
+_MAX_STALLED_COUNT = int(os.getenv('BULLMQ_MAX_STALLED_COUNT', 0))
+_STALLED_INTERVAL_MS = int(os.getenv('BULLMQ_STALLED_INTERVAL_MS', _LOCK_DURATION_MS))
+
+
+async def _extend_lock(job, token: str) -> None:
+    try:
+        await job.scripts.extendLock(job.id, token, _LOCK_DURATION_MS)
+        logger.debug('[LOCK_EXTENDED] job=%s', job.id)
+    except Exception as e:
+        logger.warning('[LOCK_EXTEND_FAIL] job=%s: %s', job.id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +593,13 @@ async def _process_job(job, token):
 
     logger.info('[JOB_START] id=%s appProcessId=%s processType=%s url=%s',
                 job.id, process_id, process_type, url)
+    _set_active_scan(job.id, process_id, scan_execution_id)
+
+    await _publish({
+        'appProcessId': process_id,
+        'appScanExecutionId': scan_execution_id,
+        'status': 'IN_PROGRESS',
+    }, job_name='app-binary-scan-result-processing', queue_name=_get_output_queue())
 
     loop = asyncio.get_event_loop()
 
@@ -459,9 +609,11 @@ async def _process_job(job, token):
         apk_bytes, filename = await loop.run_in_executor(None, _download_apk, url)
         logger.info('[JOB_DOWNLOAD_OK] id=%s file=%s size=%d bytes elapsed=%.2fs',
                     job.id, filename, len(apk_bytes), time.time() - t0)
+        await _extend_lock(job, token)
     except Exception as exc:
         logger.error('[JOB_DOWNLOAD_FAIL] id=%s appProcessId=%s elapsed=%.2fs error=%s: %s',
                      job.id, process_id, time.time() - t0, type(exc).__name__, exc)
+        _clear_active_scan()
         await _publish({'appProcessId': process_id, 'appScanExecutionId': scan_execution_id,
                         'status': 'FAILED', 'error': 'download_failed', 'message': str(exc)},
                        job_name='app-binary-scan-result-download-error')
@@ -470,38 +622,168 @@ async def _process_job(job, token):
     # --- Scan ---
     t0 = time.time()
     try:
-        checksum, report = await loop.run_in_executor(None, _run_static_scan, filename, apk_bytes)
+        checksum, report = await loop.run_in_executor(
+            None, _run_static_scan, filename, apk_bytes, scan_execution_id, process_id)
         appsec = get_android_dashboard(report, from_ctx=True)
         report['security_score'] = appsec.get('security_score')
         logger.info('[JOB_SCAN_OK] id=%s file=%s elapsed=%.2fs', job.id, filename, time.time() - t0)
+        await _extend_lock(job, token)
     except Exception as exc:
         logger.error('[JOB_SCAN_FAIL] id=%s appProcessId=%s file=%s elapsed=%.2fs error=%s: %s',
                      job.id, process_id, filename, time.time() - t0, type(exc).__name__, exc)
+        _clear_active_scan()
         await _publish({'appProcessId': process_id, 'appScanExecutionId': scan_execution_id,
                         'status': 'FAILED', 'error': 'scan_failed', 'message': str(exc), 'fileName': filename},
                        job_name='app-binary-scan-result-scan-error')
         return
+
+    # --- Upload report JSON to S3 ---
+    report_url = await loop.run_in_executor(None, _upload_report_to_s3, report, url)
+    if not report_url:
+        logger.warning('[JOB_REPORT_SKIP] id=%s report upload failed or skipped (non-S3 source)', job.id)
 
     # --- Generate and upload PDF ---
     t0 = time.time()
     pdf_bytes = await loop.run_in_executor(None, _generate_pdf, checksum)
     pdf_s3_uri = None
     if pdf_bytes:
-        pdf_s3_uri = await loop.run_in_executor(None, _upload_pdf_to_s3, pdf_bytes, url, checksum)
+        pdf_s3_uri = await loop.run_in_executor(None, _upload_pdf_to_s3, pdf_bytes, url)
     else:
         logger.warning('[JOB_PDF_SKIP] id=%s PDF generation failed or skipped', job.id)
+    await _extend_lock(job, token)
 
     # --- Done ---
-    logger.info('[JOB_DONE] id=%s appProcessId=%s file=%s pdf=%s total_elapsed=%.2fs',
-                job.id, process_id, filename, pdf_s3_uri or 'none', time.time() - job_start)
+    _clear_active_scan()
+    logger.info('[JOB_DONE] id=%s appProcessId=%s file=%s report=%s pdf=%s total_elapsed=%.2fs',
+                job.id, process_id, filename, report_url or 'none', pdf_s3_uri or 'none', time.time() - job_start)
     await _publish({
         'appProcessId': process_id,
         'appScanExecutionId': scan_execution_id,
         'status': 'COMPLETED',
         'fileName': filename,
-        'report': report,
+        'reportUrl': report_url,
         'pdfReportUrl': pdf_s3_uri,
     }, job_name='app-binary-scan-result-success')
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Stalled job recovery
+# ---------------------------------------------------------------------------
+
+_STALL_THRESHOLD_S = int(os.getenv('BULLMQ_STALL_THRESHOLD_S', 10 * 60))  # 10 min default
+
+
+async def _recover_stalled_jobs(input_queue: str, conn) -> None:
+    """At worker startup, retry active jobs that are no longer making progress.
+
+    A job is considered stalled when:
+    - its appScanExecutionId has no checksum mapping in Redis (scan never started), or
+    - the last SCAN_LOG entry is older than BULLMQ_STALL_THRESHOLD_S seconds.
+    """
+    from datetime import datetime, timezone as tz
+    from asgiref.sync import sync_to_async
+    from mobsf.MobSF.utils import get_scan_logs
+    get_scan_logs_async = sync_to_async(get_scan_logs)
+
+    q = Queue(input_queue, {'connection': conn})
+    try:
+        # bullmq's getActive() uses list.reverse() which returns None in Python → TypeError in cluster mode.
+        # Fetch active job IDs directly from Redis instead.
+        queue_key_prefix = f'bull:{input_queue}'
+        active_key = f'{queue_key_prefix}:active'
+        try:
+            if isinstance(conn, redis.asyncio.RedisCluster):
+                raw_ids = await conn.lrange(active_key, 0, -1)
+            else:
+                tmp = redis.asyncio.Redis(**conn, decode_responses=True) if isinstance(conn, dict) else conn
+                raw_ids = await tmp.lrange(active_key, 0, -1)
+                if isinstance(conn, dict):
+                    await tmp.aclose()
+        except Exception as e:
+            logger.warning('[RECOVER] Cannot read active jobs from Redis: %s', e)
+            return
+
+        if not raw_ids:
+            logger.info('[RECOVER] No active jobs found at startup')
+            return
+
+        logger.info('[RECOVER] Found %d active job(s) — checking for stalls', len(raw_ids))
+
+        active_jobs = []
+        for job_id in raw_ids:
+            try:
+                job = await Job.fromId(q, job_id)
+                if job:
+                    active_jobs.append(job)
+            except Exception as e:
+                logger.warning('[RECOVER] Cannot load job id=%s: %s', job_id, e)
+
+        r = None
+        try:
+            r = _redis_worker_client()
+        except Exception as e:
+            logger.warning('[RECOVER] Cannot connect to Redis for stall check: %s', e)
+
+        now = datetime.now(tz.utc)
+
+        for job in active_jobs:
+            job_data = (job.data or {}).get('jobData', job.data or {})
+            exec_id = job_data.get('appScanExecutionId')
+            process_id = job_data.get('appProcessId')
+
+            checksum = None
+            if r and exec_id:
+                checksum = r.get(f'mobsf:scan_exec:{exec_id}')
+            if r and not checksum and process_id:
+                checksum = r.get(f'mobsf:scan_proc:{process_id}')
+
+            stalled = False
+            reason = ''
+
+            if not checksum:
+                stalled = True
+                reason = 'no checksum mapping in Redis (scan never started)'
+            else:
+                logs = await get_scan_logs_async(checksum)
+                if not logs:
+                    stalled = True
+                    reason = f'checksum={checksum} but no scan logs in DB'
+                else:
+                    last_ts_str = logs[-1].get('timestamp', '')
+                    try:
+                        last_ts = datetime.strptime(last_ts_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=tz.utc)
+                        age_s = (now - last_ts).total_seconds()
+                        if age_s > _STALL_THRESHOLD_S:
+                            stalled = True
+                            reason = f'last log {int(age_s)}s ago (threshold={_STALL_THRESHOLD_S}s)'
+                        else:
+                            logger.info('[RECOVER] job=%s is active and progressing (last log %ds ago)',
+                                        job.id, int(age_s))
+                    except ValueError:
+                        stalled = True
+                        reason = f'cannot parse last log timestamp: {last_ts_str!r}'
+
+            if stalled:
+                try:
+                    # active jobs must be moved to failed first before retry() can be called
+                    await job.moveToFailed(Exception('stalled'), '0')
+                    await job.retry()
+                    logger.warning('[RECOVER] job=%s appProcessId=%s moved to waiting — %s',
+                                   job.id, process_id, reason)
+                except Exception as e:
+                    logger.error('[RECOVER] job=%s recovery failed: %s', job.id, e)
+
+        if r:
+            try:
+                r.close()
+            except Exception:
+                pass
+    finally:
+        try:
+            await q.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -528,11 +810,17 @@ async def _run_worker():
             logger.error('[WORKER_START] Redis unreachable, aborting')
             return True
 
+        await _recover_stalled_jobs(input_queue, conn)
+
         # lockDuration 45 min — longer than worst-case scan time (~30 min).
-        # Prevents job from moving back to waiting during long scans.
+        # maxStalledCount 0 — never auto-move stalled jobs to completed/failed,
+        # manual lock renewal in _process_job handles lock extension between steps.
+        # stalledInterval matches lockDuration to avoid premature stale detection.
         worker = Worker(input_queue, _process_job, {
             'connection': conn,
-            'lockDuration': 45 * 60 * 1000,
+            'lockDuration': _LOCK_DURATION_MS,
+            'maxStalledCount': _MAX_STALLED_COUNT,
+            'stalledInterval': _STALLED_INTERVAL_MS,
         })
         logger.info('[WORKER_READY] Listening on queue=%s', input_queue)
 

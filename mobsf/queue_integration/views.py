@@ -151,6 +151,65 @@ class ErrorResponse(Schema):
     message: str
 
 
+class QueueStats(Schema):
+    queue: str
+    waiting: int
+    active: int
+    completed: int
+    failed: int
+    delayed: int
+    paused: int
+
+
+class QueueStatsResponse(Schema):
+    queues: list[QueueStats]
+
+
+class JobSummary(Schema):
+    id: str
+    name: str
+    status: str
+    timestamp: int | None
+    processedOn: int | None
+    finishedOn: int | None
+    attemptsMade: int
+    failedReason: str | None
+    data_keys: list[str]
+
+
+class JobListResponse(Schema):
+    queue: str
+    status: str
+    total: int
+    jobs: list[JobSummary]
+
+
+class JobActionResponse(Schema):
+    job_id: str
+    queue: str
+    action: str
+    status: str
+
+
+class ScanLogEntry(Schema):
+    timestamp: str
+    status: str
+    exception: str | None
+
+
+class ScanLogsResponse(Schema):
+    checksum: str
+    logs: list[ScanLogEntry]
+
+
+class ActiveScanResponse(Schema):
+    jobId: str
+    appProcessId: str
+    appScanExecutionId: str | None
+    startedAt: int
+    elapsedSeconds: int
+
+
 class HealthResponse(Schema):
     status: str
     version: str
@@ -311,6 +370,121 @@ async def _push_to_queue(process_id: str, scan_execution_id: str, process_type: 
 # Endpoints
 # ---------------------------------------------------------------------------
 
+def _redis_sync_client():
+    """Return a sync Redis client — RedisCluster in IAM/cluster mode, Redis otherwise."""
+    from mobsf.queue_integration.aws_auth import get_memorydb_auth_token, should_use_iam_auth
+    host = os.getenv('VALKEY_HOST', 'localhost')
+    port = int(os.getenv('VALKEY_PORT', '6379'))
+    username = os.getenv('VALKEY_USERNAME', 'default')
+    password = get_memorydb_auth_token()
+    if should_use_iam_auth():
+        return redis.RedisCluster(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            ssl=True,
+            ssl_cert_reqs=None,
+            ssl_check_hostname=False,
+            socket_timeout=10,
+            decode_responses=True,
+            require_full_coverage=False,
+        )
+    return redis.Redis(host=host, port=port, username=username, password=password, decode_responses=True)
+
+
+def _resolve_checksum(appScanExecutionId: str | None, appProcessId: str | None) -> str | None:
+    r = _redis_sync_client()
+    try:
+        if appScanExecutionId:
+            v = r.get(f'mobsf:scan_exec:{appScanExecutionId}')
+            if v:
+                return v
+        if appProcessId:
+            v = r.get(f'mobsf:scan_proc:{appProcessId}')
+            if v:
+                return v
+        return None
+    finally:
+        r.close()
+
+
+@api.get(
+    '/scan/logs',
+    response={200: ScanLogsResponse, codes_4xx: ErrorResponse, codes_5xx: ErrorResponse},
+    summary='Get scan progress logs',
+    description=(
+        'Returns MobSF scan stage logs for a given `appScanExecutionId` or `appProcessId`. '
+        'Logs are available as soon as the scan starts and are updated in real time. '
+        'Requires at least one of the two query parameters.'
+    ),
+    tags=['Scan'],
+)
+def get_scan_logs(request, appScanExecutionId: str = None, appProcessId: str = None):
+    from mobsf.MobSF.utils import get_scan_logs as _get_scan_logs
+    if not appScanExecutionId and not appProcessId:
+        return 400, ErrorResponse(
+            error='missing_param',
+            message='Provide appScanExecutionId or appProcessId',
+        )
+    try:
+        checksum = _resolve_checksum(appScanExecutionId, appProcessId)
+    except Exception as exc:
+        logger.exception('[SCAN_LOGS_REDIS_ERROR]')
+        return 500, ErrorResponse(error='redis_error', message=str(exc))
+
+    if not checksum:
+        return 404, ErrorResponse(
+            error='not_found',
+            message='No scan found for the given ID. Scan may not have started yet or mapping expired.',
+        )
+    raw_logs = _get_scan_logs(checksum)
+    logs = [
+        ScanLogEntry(
+            timestamp=entry.get('timestamp', ''),
+            status=entry.get('status', ''),
+            exception=entry.get('exception'),
+        )
+        for entry in raw_logs
+    ]
+    return 200, ScanLogsResponse(checksum=checksum, logs=logs)
+
+
+@api.get(
+    '/scan/active',
+    response={200: ActiveScanResponse, codes_4xx: ErrorResponse, codes_5xx: ErrorResponse},
+    summary='Get currently active scan',
+    description='Returns the job ID and process IDs of the scan currently being processed by the worker, or 404 if idle.',
+    tags=['Scan'],
+)
+def get_active_scan(request):
+    import json as _json
+    import time as _time
+    try:
+        r = _redis_sync_client()
+        raw = r.get('mobsf:active_scan')
+        r.close()
+    except Exception as exc:
+        logger.exception('[ACTIVE_SCAN_REDIS_ERROR]')
+        return 500, ErrorResponse(error='redis_error', message=str(exc))
+
+    if not raw:
+        return 404, ErrorResponse(error='not_found', message='No scan is currently being processed.')
+
+    try:
+        data = _json.loads(raw)
+        started_at = data.get('startedAt', 0)
+        return 200, ActiveScanResponse(
+            jobId=data['jobId'],
+            appProcessId=data['appProcessId'],
+            appScanExecutionId=data.get('appScanExecutionId'),
+            startedAt=started_at,
+            elapsedSeconds=int(_time.time()) - started_at,
+        )
+    except Exception as exc:
+        return 500, ErrorResponse(error='parse_error', message=str(exc))
+
+
 @api.get(
     '/health',
     response={200: HealthResponse},
@@ -326,6 +500,30 @@ def health_check(request):
         tag=os.getenv('MOBSFSCAN_TAG', 'unknown'),
         commit=_get_commit_hash(),
     )
+
+
+class ClearCacheResponse(Schema):
+    deleted_scans: int
+    deleted_results: int
+
+
+@api.delete(
+    '/scans/cache',
+    response={200: ClearCacheResponse, codes_5xx: ErrorResponse},
+    summary='Clear scan cache',
+    description='Deletes all entries from RecentScansDB and StaticAnalyzerAndroid so every application is re-scanned from scratch.',
+    tags=['Scans'],
+)
+def clear_scan_cache(request):
+    try:
+        from mobsf.StaticAnalyzer.models import RecentScansDB, StaticAnalyzerAndroid
+        deleted_scans, _ = RecentScansDB.objects.all().delete()
+        deleted_results, _ = StaticAnalyzerAndroid.objects.all().delete()
+        logger.info('[CACHE_CLEAR] deleted_scans=%d deleted_results=%d', deleted_scans, deleted_results)
+        return 200, ClearCacheResponse(deleted_scans=deleted_scans, deleted_results=deleted_results)
+    except Exception as exc:
+        logger.exception('[CACHE_CLEAR_ERROR]')
+        return 500, ErrorResponse(error='cache_clear_error', message=str(exc))
 
 
 @api.post(
@@ -400,3 +598,195 @@ def get_queue_config(request):
         valkey_host=host,
         valkey_port=port,
     )
+
+
+async def _get_queue_stats(queue_name: str) -> QueueStats:
+    q = _build_queue(queue_name)
+    try:
+        counts = await q.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed', 'paused')
+        return QueueStats(
+            queue=queue_name,
+            waiting=counts.get('waiting', 0),
+            active=counts.get('active', 0),
+            completed=counts.get('completed', 0),
+            failed=counts.get('failed', 0),
+            delayed=counts.get('delayed', 0),
+            paused=counts.get('paused', 0),
+        )
+    finally:
+        try:
+            await q.close()
+        except Exception:
+            pass
+
+
+@api.get(
+    '/stats',
+    response={200: QueueStatsResponse, codes_5xx: ErrorResponse},
+    summary='Get job counts for all queues',
+    description='Returns waiting/active/completed/failed/delayed/paused counts for input, output and errors queues.',
+    tags=['Queue'],
+)
+def get_queue_stats(request):
+    queue_names = [
+        _get_input_queue(),
+        _get_output_queue(),
+        os.getenv('QUEUE_ERRORS', '{app-scanner-errors}'),
+    ]
+    try:
+        async def _gather():
+            return await asyncio.gather(*[_get_queue_stats(q) for q in queue_names])
+        stats = asyncio.run(_gather())
+        return 200, QueueStatsResponse(queues=list(stats))
+    except Exception as exc:
+        logger.exception('[STATS_ERROR]')
+        return 500, ErrorResponse(error='stats_error', message=str(exc))
+
+
+def _job_to_summary(job, status: str) -> JobSummary:
+    data = job.data or {}
+    job_data = data.get('jobData', data)
+    return JobSummary(
+        id=str(job.id),
+        name=job.name or '',
+        status=status,
+        timestamp=getattr(job, 'timestamp', None),
+        processedOn=getattr(job, 'processedOn', None),
+        finishedOn=getattr(job, 'finishedOn', None),
+        attemptsMade=getattr(job, 'attemptsMade', 0) or 0,
+        failedReason=getattr(job, 'failedReason', None),
+        data_keys=list(job_data.keys()) if isinstance(job_data, dict) else list(data.keys()),
+    )
+
+
+async def _get_jobs(queue_name: str, status: str, start: int, end: int) -> list[JobSummary]:
+    q = _build_queue(queue_name)
+    try:
+        method_map = {
+            'waiting': q.getWaiting,
+            'active': q.getActive,
+            'completed': q.getCompleted,
+            'failed': q.getFailed,
+            'delayed': q.getDelayed,
+        }
+        getter = method_map.get(status)
+        if getter is None:
+            raise ValueError(f'Unknown status: {status}')
+        jobs = await getter(start, end)
+        return [_job_to_summary(j, status) for j in jobs]
+    finally:
+        try:
+            await q.close()
+        except Exception:
+            pass
+
+
+VALID_STATUSES = {'waiting', 'active', 'completed', 'failed', 'delayed'}
+QUEUE_ALIASES = {
+    'input': lambda: _get_input_queue(),
+    'output': lambda: _get_output_queue(),
+    'errors': lambda: os.getenv('QUEUE_ERRORS', '{app-scanner-errors}'),
+}
+
+
+@api.get(
+    '/jobs/{queue_name}/{status}',
+    response={200: JobListResponse, codes_4xx: ErrorResponse, codes_5xx: ErrorResponse},
+    summary='List jobs by queue and status',
+    description=(
+        'Returns a list of jobs for a given queue and status. '
+        'Use queue aliases: `input`, `output`, `errors`. '
+        f'Valid statuses: {", ".join(sorted(VALID_STATUSES))}. '
+        'Pagination via `start` and `end` (0-based, inclusive).'
+    ),
+    tags=['Queue'],
+)
+def list_jobs(request, queue_name: str, status: str, start: int = 0, end: int = 49):
+    if status not in VALID_STATUSES:
+        return 400, ErrorResponse(
+            error='invalid_status',
+            message=f'Status must be one of: {", ".join(sorted(VALID_STATUSES))}',
+        )
+    resolved = QUEUE_ALIASES.get(queue_name, lambda: queue_name)()
+    try:
+        jobs = asyncio.run(_get_jobs(resolved, status, start, end))
+        return 200, JobListResponse(
+            queue=resolved,
+            status=status,
+            total=len(jobs),
+            jobs=jobs,
+        )
+    except ValueError as exc:
+        return 400, ErrorResponse(error='invalid_request', message=str(exc))
+    except Exception as exc:
+        logger.exception('[LIST_JOBS_ERROR] queue=%s status=%s', resolved, status)
+        return 500, ErrorResponse(error='list_jobs_error', message=str(exc))
+
+
+async def _job_action(queue_name: str, job_id: str, action: str) -> JobActionResponse:
+    from bullmq import Job
+    q = _build_queue(queue_name)
+    try:
+        job = await Job.fromId(q, job_id)
+        if job is None:
+            raise ValueError(f'Job {job_id} not found in queue {queue_name}')
+        if action == 'retry':
+            await job.retry()
+        elif action == 'remove':
+            await job.remove()
+        else:
+            raise ValueError(f'Unknown action: {action}')
+        return JobActionResponse(job_id=job_id, queue=queue_name, action=action, status='ok')
+    finally:
+        try:
+            await q.close()
+        except Exception:
+            pass
+
+
+@api.post(
+    '/jobs/{queue_name}/{job_id}/retry',
+    response={200: JobActionResponse, codes_4xx: ErrorResponse, codes_5xx: ErrorResponse},
+    summary='Retry a job',
+    description=(
+        'Moves a job back to `waiting` so it can be picked up again by the worker. '
+        'Use this to recover stalled `active` or `failed` jobs. '
+        'Use queue aliases: `input`, `output`, `errors`.'
+    ),
+    tags=['Queue'],
+)
+def retry_job(request, queue_name: str, job_id: str):
+    resolved = QUEUE_ALIASES.get(queue_name, lambda: queue_name)()
+    try:
+        result = asyncio.run(_job_action(resolved, job_id, 'retry'))
+        logger.info('[JOB_RETRY] queue=%s job_id=%s', resolved, job_id)
+        return 200, result
+    except ValueError as exc:
+        return 404, ErrorResponse(error='not_found', message=str(exc))
+    except Exception as exc:
+        logger.exception('[JOB_RETRY_ERROR] queue=%s job_id=%s', resolved, job_id)
+        return 500, ErrorResponse(error='retry_error', message=str(exc))
+
+
+@api.delete(
+    '/jobs/{queue_name}/{job_id}',
+    response={200: JobActionResponse, codes_4xx: ErrorResponse, codes_5xx: ErrorResponse},
+    summary='Remove a job',
+    description=(
+        'Permanently removes a job from the queue regardless of its current status. '
+        'Use this to clean up stuck `active` jobs after a worker crash. '
+        'Use queue aliases: `input`, `output`, `errors`.'
+    ),
+    tags=['Queue'],
+)
+def remove_job(request, queue_name: str, job_id: str):
+    resolved = QUEUE_ALIASES.get(queue_name, lambda: queue_name)()
+    try:
+        result = asyncio.run(_job_action(resolved, job_id, 'remove'))
+        logger.info('[JOB_REMOVE] queue=%s job_id=%s', resolved, job_id)
+        return 200, result
+    except ValueError as exc:
+        return 404, ErrorResponse(error='not_found', message=str(exc))
+    except Exception as exc:
+        logger.exception('[JOB_REMOVE_ERROR] queue=%s job_id=%s', resolved, job_id)
+        return 500, ErrorResponse(error='remove_error', message=str(exc))
