@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+python3 manage.py wait_for_db --timeout 60
+
 # Run Django migrations
 python3 manage.py makemigrations
 python3 manage.py makemigrations StaticAnalyzer
