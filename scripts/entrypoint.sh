@@ -1,5 +1,7 @@
 #!/bin/bash
-set -e 
+set -e
+
+python3 manage.py wait_for_db --timeout 60
 
 python3 manage.py makemigrations && \
 python3 manage.py makemigrations StaticAnalyzer && \

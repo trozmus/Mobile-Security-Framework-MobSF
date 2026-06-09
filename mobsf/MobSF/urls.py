@@ -29,6 +29,7 @@ from mobsf.MobSF.security import (
 from mobsf.MobSF.views import (
     authentication,
     authorization,
+    health,
     home,
     saml2,
 )
@@ -63,6 +64,7 @@ checksum_regex = r'(?P<checksum>[0-9a-f]{32})'
 paginate = r'(?P<page_size>[0-9]{1,10})/(?P<page_number>[0-9]{1,10})'
 
 urlpatterns = [
+    re_path(r'^healthz$', health.healthz, name='healthz'),
     re_path(r'^login/$',
             authentication.login_view,
             name='login'),

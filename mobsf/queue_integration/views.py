@@ -215,6 +215,7 @@ class HealthResponse(Schema):
     version: str
     tag: str
     commit: str
+    db: str
 
 
 def _get_commit_hash() -> str:
@@ -487,19 +488,29 @@ def get_active_scan(request):
 
 @api.get(
     '/health',
-    response={200: HealthResponse},
+    response={200: HealthResponse, 503: HealthResponse},
     summary='Health check',
-    description='Returns service status and version.',
+    description='Returns service status, version, and database connectivity.',
     tags=['Health'],
     auth=None,
 )
 def health_check(request):
-    return HealthResponse(
-        status='ok',
+    from django.db import connections
+    from django.db.utils import OperationalError
+    try:
+        connections['default'].ensure_connection()
+        db_status = 'ok'
+    except OperationalError as exc:
+        db_status = str(exc)
+    status = 'ok' if db_status == 'ok' else 'error'
+    payload = HealthResponse(
+        status=status,
         version=api.version,
         tag=os.getenv('MOBSFSCAN_TAG', 'unknown'),
         commit=_get_commit_hash(),
+        db=db_status,
     )
+    return 503 if status == 'error' else 200, payload
 
 
 class ClearCacheResponse(Schema):
