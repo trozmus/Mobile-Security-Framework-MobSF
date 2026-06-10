@@ -772,7 +772,16 @@ async def _recover_stalled_jobs(input_queue: str, conn) -> None:
 
             if stalled:
                 try:
-                    # active jobs must be moved to failed first before retry() can be called
+                    # Use the job's own lock token if available, otherwise force-remove
+                    # the lock key directly so moveToFailed can proceed.
+                    lock_key = f'bull:{input_queue}:{job.id}:lock'
+                    try:
+                        if isinstance(conn, redis.asyncio.RedisCluster):
+                            await conn.delete(lock_key)
+                        else:
+                            await conn.delete(lock_key)
+                    except Exception as lock_err:
+                        logger.warning('[RECOVER] job=%s could not delete lock key: %s', job.id, lock_err)
                     await job.moveToFailed(Exception('stalled'), '0')
                     await job.retry()
                     logger.warning('[RECOVER] job=%s appProcessId=%s moved to waiting — %s',
@@ -830,9 +839,21 @@ async def _run_worker():
         })
         logger.info('[WORKER_READY] Listening on queue=%s', input_queue)
 
+        _consecutive_ping_failures = 0
         while True:
             await asyncio.sleep(15)
-            logger.debug('[WORKER_HEARTBEAT] alive queue=%s', input_queue)
+            if not await _ping_connection(conn):
+                _consecutive_ping_failures += 1
+                logger.warning(
+                    '[WORKER_HEARTBEAT] Redis ping failed (attempt %d/3) queue=%s',
+                    _consecutive_ping_failures, input_queue,
+                )
+                if _consecutive_ping_failures >= 3:
+                    logger.error('[WORKER_HEARTBEAT] Redis unreachable after 3 attempts — restarting')
+                    return True
+            else:
+                _consecutive_ping_failures = 0
+                logger.debug('[WORKER_HEARTBEAT] alive queue=%s', input_queue)
 
     except (AuthenticationError, RedisConnectionError) as e:
         logger.warning('[WORKER_AUTH_ERROR] %s — restarting with fresh credentials', e)
