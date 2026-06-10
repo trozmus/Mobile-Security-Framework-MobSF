@@ -33,6 +33,7 @@ import redis
 import redis.asyncio
 import requests
 from django.conf import settings
+from django.db import close_old_connections
 from django.core.management.base import BaseCommand
 
 from bullmq import Job, Queue, Worker
@@ -469,6 +470,11 @@ def _run_static_scan(
         scan_execution_id: str | None = None,
         process_id: str | None = None,
 ) -> tuple[str, dict]:
+    # Force Django to drop any stale thread-local DB connection before use.
+    # Threads in the executor pool can hold connections longer than the IAM
+    # token TTL (15 min), causing auth failures on reuse. close_old_connections
+    # ensures the next DB call opens a fresh connection with a new token.
+    close_old_connections()
     buf = io.BufferedReader(io.BytesIO(apk_bytes))
     checksum = handle_uploaded_file(buf, '.apk')
     _store_scan_mapping(scan_execution_id, process_id, checksum)
