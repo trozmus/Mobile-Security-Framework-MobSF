@@ -384,10 +384,11 @@ def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str) -> str | None:
             Key=pdf_key,
             Body=pdf_bytes,
             ContentType='application/pdf',
+            ACL='public-read',
         )
-        pdf_url = _presign_s3_url(bucket, pdf_key, region)
-        logger.info('[PDF_UPLOAD_OK] s3://%s/%s size=%d bytes ttl=%ds',
-                    bucket, pdf_key, len(pdf_bytes), _S3_PRESIGN_TTL)
+        pdf_url = f'https://{bucket}.s3.{region}.amazonaws.com/{pdf_key}'
+        logger.info('[PDF_UPLOAD_OK] s3://%s/%s size=%d bytes url=%s',
+                    bucket, pdf_key, len(pdf_bytes), pdf_url)
         return pdf_url
     except Exception as e:
         logger.error('[PDF_UPLOAD_FAIL] bucket=%s key=%s error=%s: %s',
