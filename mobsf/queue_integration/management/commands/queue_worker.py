@@ -367,11 +367,13 @@ def _upload_report_to_s3(report: dict, source_url: str) -> str | None:
 
 
 def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str) -> str | None:
-    s3_loc = _parse_s3_url(source_url)
-    if not s3_loc:
+    bucket = os.getenv('AWS_BUCKET_NAME_PUBLIC')
+    if not bucket:
+        logger.warning('[PDF_UPLOAD] AWS_BUCKET_NAME_PUBLIC not set — skipping PDF upload')
         return None
 
-    bucket, apk_key = s3_loc
+    s3_loc = _parse_s3_url(source_url)
+    apk_key = s3_loc[1] if s3_loc else urlparse(source_url).path.lstrip('/')
     apk_dir = os.path.dirname(apk_key)
     pdf_filename = os.path.splitext(os.path.basename(apk_key))[0] + '.pdf'
     pdf_key = f'{apk_dir}/{pdf_filename}' if apk_dir else pdf_filename
@@ -384,7 +386,6 @@ def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str) -> str | None:
             Key=pdf_key,
             Body=pdf_bytes,
             ContentType='application/pdf',
-            ACL='public-read',
         )
         pdf_url = f'https://{bucket}.s3.{region}.amazonaws.com/{pdf_key}'
         logger.info('[PDF_UPLOAD_OK] s3://%s/%s size=%d bytes url=%s',
