@@ -495,14 +495,9 @@ def get_active_scan(request):
     auth=None,
 )
 def health_check(request):
-    from django.db import connections
-    from django.db.utils import OperationalError
-    try:
-        connections['default'].ensure_connection()
-        db_status = 'ok'
-    except OperationalError as exc:
-        db_status = str(exc)
-    status = 'ok' if db_status == 'ok' else 'error'
+    from mobsf.MobSF.views.health import _check_db
+    ok, db_status = _check_db()
+    status = 'ok' if ok else 'error'
     payload = HealthResponse(
         status=status,
         version=api.version,

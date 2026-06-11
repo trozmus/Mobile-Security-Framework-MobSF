@@ -33,6 +33,7 @@ import redis
 import redis.asyncio
 import requests
 from django.conf import settings
+from django.db import close_old_connections
 from django.core.management.base import BaseCommand
 
 from bullmq import Job, Queue, Worker
@@ -366,11 +367,13 @@ def _upload_report_to_s3(report: dict, source_url: str) -> str | None:
 
 
 def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str) -> str | None:
-    s3_loc = _parse_s3_url(source_url)
-    if not s3_loc:
+    bucket = os.getenv('AWS_BUCKET_NAME_PUBLIC')
+    if not bucket:
+        logger.warning('[PDF_UPLOAD] AWS_BUCKET_NAME_PUBLIC not set — skipping PDF upload')
         return None
 
-    bucket, apk_key = s3_loc
+    s3_loc = _parse_s3_url(source_url)
+    apk_key = s3_loc[1] if s3_loc else urlparse(source_url).path.lstrip('/')
     apk_dir = os.path.dirname(apk_key)
     pdf_filename = os.path.splitext(os.path.basename(apk_key))[0] + '.pdf'
     pdf_key = f'{apk_dir}/{pdf_filename}' if apk_dir else pdf_filename
@@ -384,9 +387,9 @@ def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str) -> str | None:
             Body=pdf_bytes,
             ContentType='application/pdf',
         )
-        pdf_url = _presign_s3_url(bucket, pdf_key, region)
-        logger.info('[PDF_UPLOAD_OK] s3://%s/%s size=%d bytes ttl=%ds',
-                    bucket, pdf_key, len(pdf_bytes), _S3_PRESIGN_TTL)
+        pdf_url = f'https://{bucket}.s3.{region}.amazonaws.com/{pdf_key}'
+        logger.info('[PDF_UPLOAD_OK] s3://%s/%s size=%d bytes url=%s',
+                    bucket, pdf_key, len(pdf_bytes), pdf_url)
         return pdf_url
     except Exception as e:
         logger.error('[PDF_UPLOAD_FAIL] bucket=%s key=%s error=%s: %s',
@@ -469,6 +472,11 @@ def _run_static_scan(
         scan_execution_id: str | None = None,
         process_id: str | None = None,
 ) -> tuple[str, dict]:
+    # Force Django to drop any stale thread-local DB connection before use.
+    # Threads in the executor pool can hold connections longer than the IAM
+    # token TTL (15 min), causing auth failures on reuse. close_old_connections
+    # ensures the next DB call opens a fresh connection with a new token.
+    close_old_connections()
     buf = io.BufferedReader(io.BytesIO(apk_bytes))
     checksum = handle_uploaded_file(buf, '.apk')
     _store_scan_mapping(scan_execution_id, process_id, checksum)
@@ -766,7 +774,16 @@ async def _recover_stalled_jobs(input_queue: str, conn) -> None:
 
             if stalled:
                 try:
-                    # active jobs must be moved to failed first before retry() can be called
+                    # Use the job's own lock token if available, otherwise force-remove
+                    # the lock key directly so moveToFailed can proceed.
+                    lock_key = f'bull:{input_queue}:{job.id}:lock'
+                    try:
+                        if isinstance(conn, redis.asyncio.RedisCluster):
+                            await conn.delete(lock_key)
+                        else:
+                            await conn.delete(lock_key)
+                    except Exception as lock_err:
+                        logger.warning('[RECOVER] job=%s could not delete lock key: %s', job.id, lock_err)
                     await job.moveToFailed(Exception('stalled'), '0')
                     await job.retry()
                     logger.warning('[RECOVER] job=%s appProcessId=%s moved to waiting — %s',
@@ -824,9 +841,21 @@ async def _run_worker():
         })
         logger.info('[WORKER_READY] Listening on queue=%s', input_queue)
 
+        _consecutive_ping_failures = 0
         while True:
             await asyncio.sleep(15)
-            logger.debug('[WORKER_HEARTBEAT] alive queue=%s', input_queue)
+            if not await _ping_connection(conn):
+                _consecutive_ping_failures += 1
+                logger.warning(
+                    '[WORKER_HEARTBEAT] Redis ping failed (attempt %d/3) queue=%s',
+                    _consecutive_ping_failures, input_queue,
+                )
+                if _consecutive_ping_failures >= 3:
+                    logger.error('[WORKER_HEARTBEAT] Redis unreachable after 3 attempts — restarting')
+                    return True
+            else:
+                _consecutive_ping_failures = 0
+                logger.debug('[WORKER_HEARTBEAT] alive queue=%s', input_queue)
 
     except (AuthenticationError, RedisConnectionError) as e:
         logger.warning('[WORKER_AUTH_ERROR] %s — restarting with fresh credentials', e)
