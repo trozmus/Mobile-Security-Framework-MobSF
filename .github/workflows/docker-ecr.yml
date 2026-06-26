@@ -126,7 +126,7 @@ jobs:
           task-definition: ${{ steps.task-def-image.outputs.task-definition }}
           service: ${{ env.ECS_SERVICE }}
           cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: false
+          wait-for-service-stability: true
 
   deploy-prod:
     name: Deploy to ECS Prod
@@ -175,4 +175,4 @@ jobs:
           task-definition: ${{ steps.task-def-image.outputs.task-definition }}
           service: ${{ env.ECS_SERVICE }}
           cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: false
+          wait-for-service-stability: true
