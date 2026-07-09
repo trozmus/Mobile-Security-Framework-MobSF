@@ -22,6 +22,8 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION || 'eu-central-1' }}
   ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'mudita-appstore-mobfscan' }}
   AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME || 'arn:aws:iam::216989105762:role/GitHub-ECR' }}
+  AWS_ROLE_TO_ASSUME_PROD: ${{ vars.AWS_ROLE_TO_ASSUME_PROD || 'arn:aws:iam::043671579572:role/GitHub-ECR' }}
+  ECR_REGISTRY_PROD: ${{ vars.ECR_REGISTRY_PROD || '043671579572.dkr.ecr.eu-central-1.amazonaws.com' }}
 
 permissions:
   contents: read
@@ -55,7 +57,7 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          role-to-assume: ${{ steps.target.outputs.name == 'prod' && env.AWS_ROLE_TO_ASSUME_PROD || env.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
@@ -143,6 +145,7 @@ jobs:
       ECS_SERVICE: appstore-prod-mobfscan-service
       ECS_TASK_DEFINITION: .aws/ecs-task-def-prod.json
       CONTAINER_NAME: appstore-prod-mobfscan
+      AWS_ROLE_TO_ASSUME: arn:aws:iam::043671579572:role/GitHub-ECS-Deploy
 
     steps:
       - name: Checkout repository
@@ -154,17 +157,13 @@ jobs:
           role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
       - name: Inject image into task definition
         id: task-def-image
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: ${{ env.ECS_TASK_DEFINITION }}
           container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          image: ${{ env.ECR_REGISTRY_PROD }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
           environment-variables: |
             MOBSFSCAN_TAG=${{ github.ref_type == 'tag' && github.ref_name || inputs.mobsfscan_tag || 'no-tag' }}
             MOBSFSCAN_COMMIT=${{ github.sha }}
