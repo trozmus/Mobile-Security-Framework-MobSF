@@ -22,8 +22,8 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION || 'eu-central-1' }}
   ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'mudita-appstore-mobfscan' }}
   AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME || 'arn:aws:iam::216989105762:role/GitHub-ECR' }}
-  AWS_ROLE_TO_ASSUME_PROD: ${{ vars.AWS_ROLE_TO_ASSUME_PROD || 'arn:aws:iam::368106969371:role/GitHub-ECR' }}
-  ECR_REGISTRY_PROD: ${{ vars.ECR_REGISTRY_PROD || '368106969371.dkr.ecr.eu-central-1.amazonaws.com' }}
+  AWS_ROLE_TO_ASSUME_PROD: ${{ vars.AWS_ROLE_TO_ASSUME_PROD || 'arn:aws:iam::043671579572:role/GitHub-ECR' }}
+  ECR_REGISTRY_PROD: ${{ vars.ECR_REGISTRY_PROD || '043671579572.dkr.ecr.eu-central-1.amazonaws.com' }}
 
 permissions:
   contents: read
@@ -145,7 +145,7 @@ jobs:
       ECS_SERVICE: appstore-prod-mobfscan-service
       ECS_TASK_DEFINITION: .aws/ecs-task-def-prod.json
       CONTAINER_NAME: appstore-prod-mobfscan
-      AWS_ROLE_TO_ASSUME: arn:aws:iam::368106969371:role/GitHub-ECS-Deploy
+      AWS_ROLE_TO_ASSUME: arn:aws:iam::043671579572:role/GitHub-ECS-Deploy
 
     steps:
       - name: Checkout repository
