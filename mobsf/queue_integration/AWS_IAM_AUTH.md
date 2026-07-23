@@ -4,7 +4,7 @@ Guide for configuring MobSF queue worker with AWS IAM authentication for MemoryD
 
 ## Overview
 
-When `NODE_ENV=dev` or `NODE_ENV=prod`, MobSF automatically uses IAM authentication instead of passwords:
+When `NODE_ENV=dev`, `NODE_ENV=stage`, or `NODE_ENV=prod`, MobSF automatically uses IAM authentication instead of passwords:
 
 - **MemoryDB/Redis**: IAM tokens generated every 15 minutes
 - **RDS/PostgreSQL**: IAM tokens with 10-minute connection lifetime

@@ -11,6 +11,9 @@ from urllib.parse import urlencode, urlunparse, ParseResult
 
 logger = logging.getLogger(__name__)
 
+# Environments that should use AWS IAM authentication for MemoryDB/RDS.
+IAM_AUTH_ENVS = frozenset({'dev', 'prod', 'stage'})
+
 try:
     import boto3
     from botocore.exceptions import BotoCoreError, NoCredentialsError
@@ -227,7 +230,7 @@ def get_memorydb_password_from_secrets() -> str:
 def get_memorydb_auth_token() -> str:
     """Get MemoryDB authentication credential.
 
-    For production (NODE_ENV=prod/dev):
+    For production-like environments (NODE_ENV=dev/prod/stage):
     - Generates short-lived IAM token via RDS API (per AWS docs for MemoryDB)
     - Token valid for 15 minutes, auto-refreshed on each connection
     - Falls back to Secrets Manager if IAM fails
@@ -319,10 +322,10 @@ def should_use_iam_auth() -> bool:
     """Check if IAM authentication should be used based on NODE_ENV.
 
     Returns:
-        True if NODE_ENV is 'dev' or 'prod', False otherwise (local development)
+        True if NODE_ENV is 'dev', 'prod', or 'stage', False otherwise (local development)
     """
     node_env = os.getenv('NODE_ENV', 'local').lower()
-    return node_env in ('dev', 'prod')
+    return node_env in IAM_AUTH_ENVS
 
 
 def get_memorydb_connection():

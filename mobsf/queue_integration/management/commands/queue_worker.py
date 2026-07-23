@@ -48,6 +48,7 @@ try:
 except ImportError:
     class AuthenticationError(Exception):
         pass
+
     class RedisConnectionError(Exception):
         pass
 
@@ -107,7 +108,8 @@ def _patch_bullmq_for_cluster() -> None:
                         job.id, self.token, self.opts.get('lockDuration'),
                     )
                 except Exception as e:
-                    logger.warning('[CLUSTER_PATCH] extendLock failed job=%s: %s', job.id, e)
+                    logger.warning(
+                        '[CLUSTER_PATCH] extendLock failed job=%s: %s', job.id, e)
 
         _BullWorker.extendLocks = _cluster_extend_locks
     except Exception as e:
@@ -139,7 +141,7 @@ def _get_errors_queue() -> str:
 def _build_connection():
     """Create redis.asyncio.RedisCluster (prod) or return opts dict (local).
 
-    In cluster mode (NODE_ENV=dev/prod) bullmq needs an async Redis client
+    In cluster mode (NODE_ENV=dev/prod/stage) bullmq needs an async Redis client
     so that Script.__call__ returns a coroutine — sync RedisCluster would
     cause 'object str can't be used in await expression'.
     """
@@ -284,7 +286,8 @@ def _generate_pdf(checksum: str) -> bytes | None:
         if icon_path:
             icon_full = os.path.join(settings.DWD_DIR, icon_path)
             if not os.path.isfile(icon_full):
-                logger.debug('[PDF_GEN] icon not found on disk, clearing icon_path: %s', icon_full)
+                logger.debug(
+                    '[PDF_GEN] icon not found on disk, clearing icon_path: %s', icon_full)
                 context['icon_path'] = ''
 
         try:
@@ -317,10 +320,12 @@ def _generate_pdf(checksum: str) -> bytes | None:
         logger.info('[PDF_GEN_OK] md5=%s size=%d bytes', checksum, len(pdf_bytes))
         return pdf_bytes
     except ImportError:
-        logger.warning('[PDF_GEN] pdfkit/wkhtmltopdf not available — skipping PDF generation')
+        logger.warning(
+            '[PDF_GEN] pdfkit/wkhtmltopdf not available — skipping PDF generation')
         return None
     except Exception as e:
-        logger.error('[PDF_GEN_FAIL] md5=%s error=%s: %s', checksum, type(e).__name__, e)
+        logger.error('[PDF_GEN_FAIL] md5=%s error=%s: %s',
+                     checksum, type(e).__name__, e)
         return None
 
 
@@ -369,7 +374,8 @@ def _upload_report_to_s3(report: dict, source_url: str) -> str | None:
 def _upload_pdf_to_s3(pdf_bytes: bytes, source_url: str) -> str | None:
     bucket = os.getenv('AWS_BUCKET_NAME_PUBLIC')
     if not bucket:
-        logger.warning('[PDF_UPLOAD] AWS_BUCKET_NAME_PUBLIC not set — skipping PDF upload')
+        logger.warning(
+            '[PDF_UPLOAD] AWS_BUCKET_NAME_PUBLIC not set — skipping PDF upload')
         return None
 
     s3_loc = _parse_s3_url(source_url)
@@ -511,7 +517,8 @@ def _run_static_scan(
 
     db_entry = StaticAnalyzerAndroid.objects.filter(MD5=checksum)
     if not db_entry.exists():
-        raise RuntimeError(f'Analysis completed but no DB entry found for md5={checksum}')
+        raise RuntimeError(
+            f'Analysis completed but no DB entry found for md5={checksum}')
 
     return checksum, get_context_from_db_entry(db_entry)
 
@@ -549,7 +556,8 @@ async def _publish(payload: dict, job_name: str, max_retries: int = 2, queue_nam
             except Exception:
                 pass
 
-    logger.error('[PUBLISH_FAILED] Exhausted %d retries. Last error: %s', max_retries, last_error)
+    logger.error('[PUBLISH_FAILED] Exhausted %d retries. Last error: %s',
+                 max_retries, last_error)
     raise last_error
 
 
@@ -587,7 +595,8 @@ async def _process_job(job, token):
     job_data = job.data.get('jobData', job.data)
 
     if 'report' in job_data or ('status' in job_data and job_data['status'] in ('COMPLETED', 'FAILED')):
-        logger.warning('[JOB_SKIP] id=%s looks like a result payload — check queue routing', job.id)
+        logger.warning(
+            '[JOB_SKIP] id=%s looks like a result payload — check queue routing', job.id)
         return
 
     process_id = job_data.get('appProcessId')
@@ -596,7 +605,8 @@ async def _process_job(job, token):
     process_type = job_data.get('processType', '?')
 
     if not process_id or not url:
-        logger.error('[JOB_INVALID] id=%s missing appProcessId=%r or url=%r', job.id, process_id, url)
+        logger.error('[JOB_INVALID] id=%s missing appProcessId=%r or url=%r',
+                     job.id, process_id, url)
         return
 
     logger.info('[JOB_START] id=%s appProcessId=%s processType=%s url=%s',
@@ -634,7 +644,8 @@ async def _process_job(job, token):
             None, _run_static_scan, filename, apk_bytes, scan_execution_id, process_id)
         appsec = get_android_dashboard(report, from_ctx=True)
         report['security_score'] = appsec.get('security_score')
-        logger.info('[JOB_SCAN_OK] id=%s file=%s elapsed=%.2fs', job.id, filename, time.time() - t0)
+        logger.info('[JOB_SCAN_OK] id=%s file=%s elapsed=%.2fs',
+                    job.id, filename, time.time() - t0)
         await _extend_lock(job, token)
     except Exception as exc:
         logger.error('[JOB_SCAN_FAIL] id=%s appProcessId=%s file=%s elapsed=%.2fs error=%s: %s',
@@ -648,7 +659,8 @@ async def _process_job(job, token):
     # --- Upload report JSON to S3 ---
     report_url = await loop.run_in_executor(None, _upload_report_to_s3, report, url)
     if not report_url:
-        logger.warning('[JOB_REPORT_SKIP] id=%s report upload failed or skipped (non-S3 source)', job.id)
+        logger.warning(
+            '[JOB_REPORT_SKIP] id=%s report upload failed or skipped (non-S3 source)', job.id)
 
     # --- Generate and upload PDF ---
     t0 = time.time()
@@ -679,7 +691,8 @@ async def _process_job(job, token):
 # Stalled job recovery
 # ---------------------------------------------------------------------------
 
-_STALL_THRESHOLD_S = int(os.getenv('BULLMQ_STALL_THRESHOLD_S', 10 * 60))  # 10 min default
+_STALL_THRESHOLD_S = int(
+    os.getenv('BULLMQ_STALL_THRESHOLD_S', 10 * 60))  # 10 min default
 
 
 async def _recover_stalled_jobs(input_queue: str, conn) -> None:
@@ -704,7 +717,8 @@ async def _recover_stalled_jobs(input_queue: str, conn) -> None:
             if isinstance(conn, redis.asyncio.RedisCluster):
                 raw_ids = await conn.lrange(active_key, 0, -1)
             else:
-                tmp = redis.asyncio.Redis(**conn, decode_responses=True) if isinstance(conn, dict) else conn
+                tmp = redis.asyncio.Redis(
+                    **conn, decode_responses=True) if isinstance(conn, dict) else conn
                 raw_ids = await tmp.lrange(active_key, 0, -1)
                 if isinstance(conn, dict):
                     await tmp.aclose()
@@ -716,7 +730,8 @@ async def _recover_stalled_jobs(input_queue: str, conn) -> None:
             logger.info('[RECOVER] No active jobs found at startup')
             return
 
-        logger.info('[RECOVER] Found %d active job(s) — checking for stalls', len(raw_ids))
+        logger.info(
+            '[RECOVER] Found %d active job(s) — checking for stalls', len(raw_ids))
 
         active_jobs = []
         for job_id in raw_ids:
@@ -760,7 +775,8 @@ async def _recover_stalled_jobs(input_queue: str, conn) -> None:
                 else:
                     last_ts_str = logs[-1].get('timestamp', '')
                     try:
-                        last_ts = datetime.strptime(last_ts_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=tz.utc)
+                        last_ts = datetime.strptime(
+                            last_ts_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=tz.utc)
                         age_s = (now - last_ts).total_seconds()
                         if age_s > _STALL_THRESHOLD_S:
                             stalled = True
@@ -783,7 +799,8 @@ async def _recover_stalled_jobs(input_queue: str, conn) -> None:
                         else:
                             await conn.delete(lock_key)
                     except Exception as lock_err:
-                        logger.warning('[RECOVER] job=%s could not delete lock key: %s', job.id, lock_err)
+                        logger.warning(
+                            '[RECOVER] job=%s could not delete lock key: %s', job.id, lock_err)
                     await job.moveToFailed(Exception('stalled'), '0')
                     await job.retry()
                     logger.warning('[RECOVER] job=%s appProcessId=%s moved to waiting — %s',
@@ -851,7 +868,8 @@ async def _run_worker():
                     _consecutive_ping_failures, input_queue,
                 )
                 if _consecutive_ping_failures >= 3:
-                    logger.error('[WORKER_HEARTBEAT] Redis unreachable after 3 attempts — restarting')
+                    logger.error(
+                        '[WORKER_HEARTBEAT] Redis unreachable after 3 attempts — restarting')
                     return True
             else:
                 _consecutive_ping_failures = 0
