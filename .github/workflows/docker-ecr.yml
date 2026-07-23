@@ -147,9 +147,9 @@ jobs:
     # GitHub-ECR role.
     env:
       ECS_CLUSTER: mudita-appstore-stage
-      ECS_SERVICE: appstore-stage-mobfscan-service
+      ECS_SERVICE: appstore-stage-scan-service
       ECS_TASK_DEFINITION: .aws/ecs-task-def-stage.json
-      CONTAINER_NAME: appstore-stage-mobfscan
+      CONTAINER_NAME: appstore-stage-scan
 
     steps:
       - name: Checkout repository
