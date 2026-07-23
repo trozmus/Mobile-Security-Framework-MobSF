@@ -2,7 +2,7 @@ name: Build and Push Docker Image to ECR and Deploy
 
 on:
   push:
-    branches: ["dev", "main", "prod"]
+    branches: ["dev", "stage", "main", "prod"]
   workflow_dispatch:
     inputs:
       environment:
@@ -12,6 +12,7 @@ on:
         default: dev
         options:
           - dev
+          - stage
           - prod
       mobsfscan_tag:
         description: "Optional MobSFScan tag for manual run"
@@ -50,6 +51,8 @@ jobs:
             echo "name=${{ inputs.environment }}" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.ref_name }}" = "dev" ]; then
             echo "name=dev" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref_name }}" = "stage" ]; then
+            echo "name=stage" >> "$GITHUB_OUTPUT"
           else
             echo "name=prod" >> "$GITHUB_OUTPUT"
           fi
@@ -96,6 +99,57 @@ jobs:
       ECS_SERVICE: appstore-dev-mobfscan-service
       ECS_TASK_DEFINITION: .aws/ecs-task-def-dev.json
       CONTAINER_NAME: appstore-dev-mobfscan
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Inject image into task definition
+        id: task-def-image
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          environment-variables: |
+            MOBSFSCAN_TAG=${{ github.ref_type == 'tag' && github.ref_name || inputs.mobsfscan_tag || 'no-tag' }}
+            MOBSFSCAN_COMMIT=${{ github.sha }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def-image.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+  deploy-stage:
+    name: Deploy to ECS Stage
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: needs.build-and-push.outputs.target_env == 'stage'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    # stage lives in the nonprod account (216989105762), same as dev → nonprod
+    # GitHub-ECR role.
+    env:
+      ECS_CLUSTER: mudita-appstore-stage
+      ECS_SERVICE: appstore-stage-scan-service
+      ECS_TASK_DEFINITION: .aws/ecs-task-def-stage.json
+      CONTAINER_NAME: appstore-stage-scan
 
     steps:
       - name: Checkout repository
