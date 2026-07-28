@@ -199,9 +199,9 @@ jobs:
 
     env:
       ECS_CLUSTER: mudita-appstore-prod
-      ECS_SERVICE: appstore-prod-mobfscan-service
+      ECS_SERVICE: appstore-prod-scan-service
       ECS_TASK_DEFINITION: .aws/ecs-task-def-prod.json
-      CONTAINER_NAME: appstore-prod-mobfscan
+      CONTAINER_NAME: appstore-prod-scan
       AWS_ROLE_TO_ASSUME: arn:aws:iam::043671579572:role/GitHub-ECS-Deploy
 
     steps:
