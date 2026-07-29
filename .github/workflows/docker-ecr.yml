@@ -99,9 +99,9 @@ jobs:
 
     env:
       ECS_CLUSTER: mudita-appstore-dev
-      ECS_SERVICE: appstore-dev-mobfscan-service
+      ECS_SERVICE: appstore-dev-scan-service
       ECS_TASK_DEFINITION: .aws/ecs-task-def-dev.json
-      CONTAINER_NAME: appstore-dev-mobfscan
+      CONTAINER_NAME: appstore-dev-scan
 
     steps:
       - name: Checkout repository
