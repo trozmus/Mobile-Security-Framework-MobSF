@@ -78,35 +78,48 @@ def get_hardcoded_cert_keystore(app_dic):
         logger.exception(msg)
 
 
-def get_cert_details(data):
-    """Get certificate details."""
-    certlist = []
+def get_cert_details_struct(data):
+    """Get certificate details as a structured dict."""
     x509_cert = asn1crypto.x509.Certificate.load(data)
     subject = util.get_certificate_name_string(x509_cert.subject, short=True)
-    certlist.append(f'X.509 Subject: {subject}')
-    certlist.append(f'Signature Algorithm: {x509_cert.signature_algo}')
     valid_from = x509_cert['tbs_certificate']['validity']['not_before'].native
-    certlist.append(f'Valid From: {valid_from}')
     valid_to = x509_cert['tbs_certificate']['validity']['not_after'].native
-    certlist.append(f'Valid To: {valid_to}')
     issuer = util.get_certificate_name_string(x509_cert.issuer, short=True)
-    certlist.append(f'Issuer: {issuer}')
-    certlist.append(f'Serial Number: {hex(x509_cert.serial_number)}')
-    certlist.append(f'Hash Algorithm: {x509_cert.hash_algo}')
-    for k, v in HASH_FUNCS.items():
-        certlist.append(f'{k}: {v(data).hexdigest()}')
+    return {
+        'subject': subject,
+        'issuer': issuer,
+        'signature_algorithm': str(x509_cert.signature_algo),
+        'valid_from': str(valid_from),
+        'valid_to': str(valid_to),
+        'serial_number': hex(x509_cert.serial_number),
+        'hash_algorithm': str(x509_cert.hash_algo),
+        'hashes': {k: v(data).hexdigest() for k, v in HASH_FUNCS.items()},
+    }
+
+
+def get_cert_details(data):
+    """Get certificate details."""
+    cert = get_cert_details_struct(data)
+    certlist = [
+        f'X.509 Subject: {cert["subject"]}',
+        f'Signature Algorithm: {cert["signature_algorithm"]}',
+        f'Valid From: {cert["valid_from"]}',
+        f'Valid To: {cert["valid_to"]}',
+        f'Issuer: {cert["issuer"]}',
+        f'Serial Number: {cert["serial_number"]}',
+        f'Hash Algorithm: {cert["hash_algorithm"]}',
+    ]
+    for k, v in cert['hashes'].items():
+        certlist.append(f'{k}: {v}')
     return certlist
 
 
-def get_pub_key_details(data):
-    """Get public key details."""
-    certlist = []
-
+def get_pub_key_details_struct(data):
+    """Get public key details as a structured dict."""
     x509_public_key = serialization.load_der_public_key(
         data,
         backend=default_backend())
     alg = 'unknown'
-    fingerprint = ''
     if isinstance(x509_public_key, rsa.RSAPublicKey):
         alg = 'rsa'
         modulus = x509_public_key.public_numbers().n
@@ -127,10 +140,21 @@ def get_pub_key_details(data):
         # Untested, possibly wrong key size and fingerprint
         to_hash += data[25:]
     fingerprint = gen_sha256_hash(to_hash)
-    certlist.append(f'PublicKey Algorithm: {alg}')
-    certlist.append(f'Bit Size: {x509_public_key.key_size}')
-    certlist.append(f'Fingerprint: {fingerprint}')
-    return certlist
+    return {
+        'algorithm': alg,
+        'bit_size': x509_public_key.key_size,
+        'fingerprint': fingerprint,
+    }
+
+
+def get_pub_key_details(data):
+    """Get public key details."""
+    key = get_pub_key_details_struct(data)
+    return [
+        f'PublicKey Algorithm: {key["algorithm"]}',
+        f'Bit Size: {key["bit_size"]}',
+        f'Fingerprint: {key["fingerprint"]}',
+    ]
 
 
 def get_signature_versions(checksum, app_path, tools_dir, signed):
@@ -186,6 +210,8 @@ def apksigtool_cert(checksum, apk_path, tools_dir):
     certlist = []
     certs = []
     pub_keys = []
+    certs_struct = []
+    pub_keys_struct = []
     signed = False
     certs_no = 0
     min_sdk = None
@@ -223,10 +249,17 @@ def apksigtool_cert(checksum, apk_path, tools_dir):
                             for i in d:
                                 if i not in certs:
                                     certs.append(i)
+                            cert_struct = get_cert_details_struct(cert.data)
+                            if cert_struct not in certs_struct:
+                                certs_struct.append(cert_struct)
                         p = get_pub_key_details(signer.public_key.data)
                         for j in p:
                             if j not in pub_keys:
                                 pub_keys.append(j)
+                        pub_key_struct = get_pub_key_details_struct(
+                            signer.public_key.data)
+                        if pub_key_struct not in pub_keys_struct:
+                            pub_keys_struct.append(pub_key_struct)
         except Exception:
             logger.warning('Failed to get signature versions with apksigtool')
 
@@ -276,6 +309,8 @@ def apksigtool_cert(checksum, apk_path, tools_dir):
         'rotation_min_sdk': rotation_min_sdk,
         'signer_fingerprints': signer_fingerprints,
         'rotated_fingerprints': rotated_fingerprints,
+        'certificates': certs_struct,
+        'public_keys': pub_keys_struct,
     }
 
 
@@ -316,11 +351,15 @@ def get_cert_data(checksum, a, app_path, tools_dir):
                     for x in a.get_signature_names()])
     pkeys = set(a.get_public_keys_der_v3() + a.get_public_keys_der_v2())
 
+    certs_struct = []
     for cert in certs:
         certlist.extend(get_cert_details(cert))
+        certs_struct.append(get_cert_details_struct(cert))
 
+    pub_keys_struct = []
     for public_key in pkeys:
         certlist.extend(get_pub_key_details(public_key))
+        pub_keys_struct.append(get_pub_key_details_struct(public_key))
 
     if len(certs) > 0:
         certlist.append(f'Found {len(certs)} unique certificates')
@@ -337,6 +376,8 @@ def get_cert_data(checksum, a, app_path, tools_dir):
         'rotation_min_sdk': rotation_min_sdk,
         'signer_fingerprints': signer_fingerprints,
         'rotated_fingerprints': rotated_fingerprints,
+        'certificates': certs_struct,
+        'public_keys': pub_keys_struct,
     }
 
 
@@ -485,6 +526,16 @@ def cert_info(app_dic, man_dict):
             'certificate_summary': summary,
             'signer_certificate_sha256': signer_fingerprints,
             'rotated_certificate_sha256': rotated_fingerprints,
+            'signing_certificates': cert_data.get('certificates') or [],
+            'public_keys': cert_data.get('public_keys') or [],
+            'signature_schemes': {
+                'v1': bool(cert_data.get('v1')),
+                'v2': bool(cert_data.get('v2')),
+                'v3': bool(cert_data.get('v3')),
+                'v4': bool(cert_data.get('v4')),
+                'is_rotated': bool(cert_data.get('is_rotated')),
+                'rotation_min_sdk': cert_data.get('rotation_min_sdk'),
+            },
         }
     except Exception as exp:
         msg = 'Reading Code Signing Certificate'
