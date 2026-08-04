@@ -164,10 +164,12 @@ def get_signature_versions(checksum, app_path, tools_dir, signed):
     rotation_min_sdk = None
     signer_fingerprints = []
     rotated_fingerprints = []
+    verify_output = ''
     try:
         if not signed:
             return (v1, v2, v3, v4, is_rotated, rotation_min_sdk,
-                    signer_fingerprints, rotated_fingerprints)
+                    signer_fingerprints, rotated_fingerprints,
+                    verify_output)
         logger.info('Getting Signature Versions')
         apksigner = Path(tools_dir) / 'apksigner.jar'
         args = [find_java_binary(), '-Xmx1024M',
@@ -177,6 +179,7 @@ def get_signature_versions(checksum, app_path, tools_dir, signed):
         out = subprocess.check_output(
             args, stderr=subprocess.STDOUT)
         out = out.decode('utf-8', 'ignore')
+        verify_output = out
         if re.findall(r'v1 scheme \(JAR signing\): true', out):
             v1 = True
         if re.findall(r'\(APK Signature Scheme v2\): true', out):
@@ -202,7 +205,7 @@ def get_signature_versions(checksum, app_path, tools_dir, signed):
         logger.error(msg)
         append_scan_status(checksum, msg, repr(exp))
     return (v1, v2, v3, v4, is_rotated, rotation_min_sdk,
-            signer_fingerprints, rotated_fingerprints)
+            signer_fingerprints, rotated_fingerprints, verify_output)
 
 
 def apksigtool_cert(checksum, apk_path, tools_dir):
@@ -268,7 +271,8 @@ def apksigtool_cert(checksum, apk_path, tools_dir):
         else:
             certlist.append('Binary is not signed')
         (v1, v2, v3, v4, is_rotated, rotation_min_sdk,
-         signer_fingerprints, rotated_fingerprints) = get_signature_versions(
+         signer_fingerprints, rotated_fingerprints,
+         verify_output) = get_signature_versions(
             checksum,
             apk_path,
             tools_dir,
@@ -311,6 +315,7 @@ def apksigtool_cert(checksum, apk_path, tools_dir):
         'rotated_fingerprints': rotated_fingerprints,
         'certificates': certs_struct,
         'public_keys': pub_keys_struct,
+        'apksigner_verify_output': verify_output,
     }
 
 
@@ -325,7 +330,8 @@ def get_cert_data(checksum, a, app_path, tools_dir):
         certlist.append('Binary is not signed')
         certlist.append('Missing certificate')
     (v1, v2, v3, v4, is_rotated, rotation_min_sdk,
-     signer_fingerprints, rotated_fingerprints) = get_signature_versions(
+     signer_fingerprints, rotated_fingerprints,
+     verify_output) = get_signature_versions(
         checksum,
         app_path,
         tools_dir,
@@ -378,6 +384,7 @@ def get_cert_data(checksum, a, app_path, tools_dir):
         'rotated_fingerprints': rotated_fingerprints,
         'certificates': certs_struct,
         'public_keys': pub_keys_struct,
+        'apksigner_verify_output': verify_output,
     }
 
 
@@ -536,6 +543,8 @@ def cert_info(app_dic, man_dict):
                 'is_rotated': bool(cert_data.get('is_rotated')),
                 'rotation_min_sdk': cert_data.get('rotation_min_sdk'),
             },
+            'apksigner_verify_output': cert_data.get(
+                'apksigner_verify_output') or '',
         }
     except Exception as exp:
         msg = 'Reading Code Signing Certificate'
