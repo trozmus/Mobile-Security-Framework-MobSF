@@ -136,6 +136,21 @@
                                             <td>{{ first_app.cert_subject }}</td>
                                             <td>{{ second_app.cert_subject }}</td>
                                         </tr>
+                                        <tr>
+                                            <td><span class="badge bg-primary">Signer SHA-256</span></td>
+                                            <td>{{ first_app.cert_fingerprint|default:"Unknown" }}</td>
+                                            <td>{{ second_app.cert_fingerprint|default:"Unknown" }}</td>
+                                        </tr>
+                                        <tr>
+                                            <td><span class="badge bg-primary">Signing Key Status</span></td>
+                                            <td colspan="2">
+                                                {% if cert_comparison.match %}
+                                                <span class="badge bg-success">Signing certificate unchanged</span>
+                                                {% else %}
+                                                <span class="badge bg-danger">Signing certificate changed since previous version &mdash; installing this build over the earlier one will fail on user devices unless proper v3 key rotation is configured</span>
+                                                {% endif %}
+                                            </td>
+                                        </tr>
                                         </tbody>
                                     </table>
                                 </div> <!-- dic table -->

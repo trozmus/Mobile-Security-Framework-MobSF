@@ -136,15 +136,20 @@ def get_pub_key_details(data):
 def get_signature_versions(checksum, app_path, tools_dir, signed):
     """Get signature versions using apksigner."""
     v1, v2, v3, v4 = False, False, False, False
+    is_rotated = False
+    rotation_min_sdk = None
+    signer_fingerprints = []
+    rotated_fingerprints = []
     try:
         if not signed:
-            return v1, v2, v3, v4
+            return (v1, v2, v3, v4, is_rotated, rotation_min_sdk,
+                    signer_fingerprints, rotated_fingerprints)
         logger.info('Getting Signature Versions')
         apksigner = Path(tools_dir) / 'apksigner.jar'
         args = [find_java_binary(), '-Xmx1024M',
                 '-Djava.library.path=', '-jar',
                 apksigner.as_posix(),
-                'verify', '--verbose', app_path]
+                'verify', '--verbose', '--print-certs', app_path]
         out = subprocess.check_output(
             args, stderr=subprocess.STDOUT)
         out = out.decode('utf-8', 'ignore')
@@ -156,11 +161,24 @@ def get_signature_versions(checksum, app_path, tools_dir, signed):
             v3 = True
         if re.findall(r'\(APK Signature Scheme v4\): true', out):
             v4 = True
+        is_rotated = bool(re.findall(
+            r'rotated signer', out, re.IGNORECASE))
+        rotation_match = re.search(
+            r'Rotation min SDK version:\s*(\d+)', out)
+        if rotation_match:
+            rotation_min_sdk = rotation_match.group(1)
+        signer_fingerprints = re.findall(
+            r'^Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]+)',
+            out, re.MULTILINE)
+        rotated_fingerprints = re.findall(
+            r'Rotated Signing Certificate History certificate '
+            r'SHA-256 digest:\s*([0-9a-fA-F]+)', out)
     except Exception as exp:
         msg = 'Failed to get signature versions with apksigner'
         logger.error(msg)
         append_scan_status(checksum, msg, repr(exp))
-    return v1, v2, v3, v4
+    return (v1, v2, v3, v4, is_rotated, rotation_min_sdk,
+            signer_fingerprints, rotated_fingerprints)
 
 
 def apksigtool_cert(checksum, apk_path, tools_dir):
@@ -216,7 +234,8 @@ def apksigtool_cert(checksum, apk_path, tools_dir):
             certlist.append('Binary is signed')
         else:
             certlist.append('Binary is not signed')
-        v1, v2, v3, v4 = get_signature_versions(
+        (v1, v2, v3, v4, is_rotated, rotation_min_sdk,
+         signer_fingerprints, rotated_fingerprints) = get_signature_versions(
             checksum,
             apk_path,
             tools_dir,
@@ -229,6 +248,14 @@ def apksigtool_cert(checksum, apk_path, tools_dir):
         certlist.append(f'v2 signature: {v2}')
         certlist.append(f'v3 signature: {v3}')
         certlist.append(f'v4 signature: {v4}')
+        certlist.append(f'Rotated signing key: {is_rotated}')
+        if rotation_min_sdk:
+            certlist.append(
+                f'Rotation min SDK version: {rotation_min_sdk}')
+        for fp in signer_fingerprints:
+            certlist.append(f'Current Signer SHA-256: {fp}')
+        for fp in rotated_fingerprints:
+            certlist.append(f'Rotated (historical) Signer SHA-256: {fp}')
         certlist.extend(certs)
         certlist.extend(pub_keys)
         certlist.append(f'Found {certs_no} unique certificates')
@@ -245,6 +272,10 @@ def apksigtool_cert(checksum, apk_path, tools_dir):
         'v3': v3,
         'v4': v4,
         'min_sdk': min_sdk,
+        'is_rotated': is_rotated,
+        'rotation_min_sdk': rotation_min_sdk,
+        'signer_fingerprints': signer_fingerprints,
+        'rotated_fingerprints': rotated_fingerprints,
     }
 
 
@@ -258,7 +289,8 @@ def get_cert_data(checksum, a, app_path, tools_dir):
     else:
         certlist.append('Binary is not signed')
         certlist.append('Missing certificate')
-    v1, v2, v3, v4 = get_signature_versions(
+    (v1, v2, v3, v4, is_rotated, rotation_min_sdk,
+     signer_fingerprints, rotated_fingerprints) = get_signature_versions(
         checksum,
         app_path,
         tools_dir,
@@ -271,6 +303,13 @@ def get_cert_data(checksum, a, app_path, tools_dir):
     certlist.append(f'v2 signature: {v2}')
     certlist.append(f'v3 signature: {v3}')
     certlist.append(f'v4 signature: {v4}')
+    certlist.append(f'Rotated signing key: {is_rotated}')
+    if rotation_min_sdk:
+        certlist.append(f'Rotation min SDK version: {rotation_min_sdk}')
+    for fp in signer_fingerprints:
+        certlist.append(f'Current Signer SHA-256: {fp}')
+    for fp in rotated_fingerprints:
+        certlist.append(f'Rotated (historical) Signer SHA-256: {fp}')
 
     certs = set(a.get_certificates_der_v3() + a.get_certificates_der_v2()
                 + [a.get_certificate_der(x)
@@ -294,6 +333,10 @@ def get_cert_data(checksum, a, app_path, tools_dir):
         'v3': v3,
         'v4': v4,
         'min_sdk': None,
+        'is_rotated': is_rotated,
+        'rotation_min_sdk': rotation_min_sdk,
+        'signer_fingerprints': signer_fingerprints,
+        'rotated_fingerprints': rotated_fingerprints,
     }
 
 
@@ -407,10 +450,41 @@ def cert_info(app_dic, man_dict):
                 'collision issues.')
             title = 'Certificate algorithm vulnerable to hash collision'
             findings.append((status, desc, title))
+        if cert_data.get('is_rotated'):
+            summary[INFO] += 1
+            desc = (
+                'Application signing key has been rotated '
+                '(APK Signature Scheme v3).')
+            if cert_data.get('rotation_min_sdk'):
+                desc += (
+                    ' Rotation applies from API level '
+                    f'{cert_data["rotation_min_sdk"]} onwards.')
+            findings.append((INFO, desc, 'Signing Key Rotation Detected'))
+        signer_fingerprints = cert_data.get('signer_fingerprints') or []
+        rotated_fingerprints = cert_data.get('rotated_fingerprints') or []
+        if signer_fingerprints:
+            summary[INFO] += 1
+            desc = (
+                'Signing certificate SHA-256 fingerprint(s): '
+                f'{", ".join(signer_fingerprints)}. '
+                'Compare this value against another scan report of the '
+                'same app to verify whether the signing key changed '
+                'between builds.')
+            findings.append((
+                INFO, desc, 'Signing Certificate Fingerprint'))
+        if rotated_fingerprints:
+            summary[INFO] += 1
+            desc = (
+                'Previous (rotated) signing certificate SHA-256 '
+                f'fingerprint(s): {", ".join(rotated_fingerprints)}.')
+            findings.append((
+                INFO, desc, 'Rotated Signing Certificate Fingerprint'))
         return {
             'certificate_info': cert_data['cert_data'],
             'certificate_findings': findings,
             'certificate_summary': summary,
+            'signer_certificate_sha256': signer_fingerprints,
+            'rotated_certificate_sha256': rotated_fingerprints,
         }
     except Exception as exp:
         msg = 'Reading Code Signing Certificate'

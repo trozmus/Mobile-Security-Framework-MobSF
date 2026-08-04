@@ -166,6 +166,13 @@ def generic_compare(request,
         else:
             context[curr_app]['cert_subject'] = 'No subject'
 
+        # Get the current signer's certificate fingerprint (SHA-256)
+        fingerprint_match = re.findall(
+            r'Current Signer SHA-256:\s*([0-9a-fA-F]+)',
+            db_context['certificate_analysis']['certificate_info'])
+        context[curr_app]['cert_fingerprint'] = (
+            fingerprint_match[0] if fingerprint_match else None)
+
         # Some preparations so we have some sort of same structures
         # (urls are lists inside the list which mess things up...)
         tmp_list = []
@@ -184,6 +191,17 @@ def generic_compare(request,
 
         db_context['urls'] = list(set(deepcopy(tmp_list)))
         tmp_list.clear()
+
+    # Compare signing certificate fingerprints to catch a signing key
+    # change between versions that would break app updates
+    first_fingerprint = context['first_app']['cert_fingerprint']
+    second_fingerprint = context['second_app']['cert_fingerprint']
+    context['cert_comparison'] = {
+        'match': bool(
+            first_fingerprint and first_fingerprint == second_fingerprint),
+        'first_fingerprint': first_fingerprint,
+        'second_fingerprint': second_fingerprint,
+    }
 
     # apkid check - we do it here just because
     # its really ugly inside the template
