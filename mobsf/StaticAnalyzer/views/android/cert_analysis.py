@@ -78,35 +78,48 @@ def get_hardcoded_cert_keystore(app_dic):
         logger.exception(msg)
 
 
-def get_cert_details(data):
-    """Get certificate details."""
-    certlist = []
+def get_cert_details_struct(data):
+    """Get certificate details as a structured dict."""
     x509_cert = asn1crypto.x509.Certificate.load(data)
     subject = util.get_certificate_name_string(x509_cert.subject, short=True)
-    certlist.append(f'X.509 Subject: {subject}')
-    certlist.append(f'Signature Algorithm: {x509_cert.signature_algo}')
     valid_from = x509_cert['tbs_certificate']['validity']['not_before'].native
-    certlist.append(f'Valid From: {valid_from}')
     valid_to = x509_cert['tbs_certificate']['validity']['not_after'].native
-    certlist.append(f'Valid To: {valid_to}')
     issuer = util.get_certificate_name_string(x509_cert.issuer, short=True)
-    certlist.append(f'Issuer: {issuer}')
-    certlist.append(f'Serial Number: {hex(x509_cert.serial_number)}')
-    certlist.append(f'Hash Algorithm: {x509_cert.hash_algo}')
-    for k, v in HASH_FUNCS.items():
-        certlist.append(f'{k}: {v(data).hexdigest()}')
+    return {
+        'subject': subject,
+        'issuer': issuer,
+        'signature_algorithm': str(x509_cert.signature_algo),
+        'valid_from': str(valid_from),
+        'valid_to': str(valid_to),
+        'serial_number': hex(x509_cert.serial_number),
+        'hash_algorithm': str(x509_cert.hash_algo),
+        'hashes': {k: v(data).hexdigest() for k, v in HASH_FUNCS.items()},
+    }
+
+
+def get_cert_details(data):
+    """Get certificate details."""
+    cert = get_cert_details_struct(data)
+    certlist = [
+        f'X.509 Subject: {cert["subject"]}',
+        f'Signature Algorithm: {cert["signature_algorithm"]}',
+        f'Valid From: {cert["valid_from"]}',
+        f'Valid To: {cert["valid_to"]}',
+        f'Issuer: {cert["issuer"]}',
+        f'Serial Number: {cert["serial_number"]}',
+        f'Hash Algorithm: {cert["hash_algorithm"]}',
+    ]
+    for k, v in cert['hashes'].items():
+        certlist.append(f'{k}: {v}')
     return certlist
 
 
-def get_pub_key_details(data):
-    """Get public key details."""
-    certlist = []
-
+def get_pub_key_details_struct(data):
+    """Get public key details as a structured dict."""
     x509_public_key = serialization.load_der_public_key(
         data,
         backend=default_backend())
     alg = 'unknown'
-    fingerprint = ''
     if isinstance(x509_public_key, rsa.RSAPublicKey):
         alg = 'rsa'
         modulus = x509_public_key.public_numbers().n
@@ -127,27 +140,156 @@ def get_pub_key_details(data):
         # Untested, possibly wrong key size and fingerprint
         to_hash += data[25:]
     fingerprint = gen_sha256_hash(to_hash)
-    certlist.append(f'PublicKey Algorithm: {alg}')
-    certlist.append(f'Bit Size: {x509_public_key.key_size}')
-    certlist.append(f'Fingerprint: {fingerprint}')
-    return certlist
+    return {
+        'algorithm': alg,
+        'bit_size': x509_public_key.key_size,
+        'fingerprint': fingerprint,
+    }
+
+
+def get_pub_key_details(data):
+    """Get public key details."""
+    key = get_pub_key_details_struct(data)
+    return [
+        f'PublicKey Algorithm: {key["algorithm"]}',
+        f'Bit Size: {key["bit_size"]}',
+        f'Fingerprint: {key["fingerprint"]}',
+    ]
+
+
+def _signer_field(block, pattern):
+    """Extract a single named field from an apksigner signer text block."""
+    m = re.search(pattern, block)
+    return m.group(1).strip() if m else None
+
+
+def parse_verify_signers(raw_output):
+    """Parse per-signer details from apksigner verify --print-certs output."""
+    signer_blocks = re.split(r'(?=Signer #\d+ certificate DN:)', raw_output)
+    signers = []
+    for block in signer_blocks:
+        dn = re.search(r'certificate DN:\s*(.*)', block)
+        if not dn:
+            continue
+        signers.append({
+            'certificate_dn': dn.group(1).strip(),
+            'certificate_sha256': _signer_field(
+                block, r'certificate SHA-256 digest:\s*([0-9a-fA-F]+)'),
+            'certificate_sha1': _signer_field(
+                block, r'certificate SHA-1 digest:\s*([0-9a-fA-F]+)'),
+            'certificate_md5': _signer_field(
+                block, r'certificate MD5 digest:\s*([0-9a-fA-F]+)'),
+            'key_algorithm': _signer_field(
+                block, r'key algorithm:\s*(\S+)'),
+            'key_size_bits': _signer_field(
+                block, r'key size \(bits\):\s*(\d+)'),
+            'public_key_sha256': _signer_field(
+                block, r'public key SHA-256 digest:\s*([0-9a-fA-F]+)'),
+            'public_key_sha1': _signer_field(
+                block, r'public key SHA-1 digest:\s*([0-9a-fA-F]+)'),
+            'public_key_md5': _signer_field(
+                block, r'public key MD5 digest:\s*([0-9a-fA-F]+)'),
+        })
+    return signers
+
+
+def parse_verify_warnings(raw_output):
+    """Parse WARNING lines from apksigner verify output."""
+    return re.findall(r'^WARNING:\s*(.*)$', raw_output, re.MULTILINE)
+
+
+def parse_lineage_signers(raw_output):
+    """Parse per-signer details from apksigner lineage --print-certs output."""
+    signer_blocks = re.split(r'(?=Signer #\d+ certificate DN:)', raw_output)
+    signers = []
+    for block in signer_blocks:
+        dn = re.search(r'certificate DN:\s*(.*)', block)
+        if not dn:
+            continue
+        signers.append({
+            'certificate_dn': dn.group(1).strip(),
+            'certificate_sha256': _signer_field(
+                block, r'certificate SHA-256 digest:\s*([0-9a-fA-F]+)'),
+            'certificate_sha1': _signer_field(
+                block, r'certificate SHA-1 digest:\s*([0-9a-fA-F]+)'),
+            'certificate_md5': _signer_field(
+                block, r'certificate MD5 digest:\s*([0-9a-fA-F]+)'),
+            'public_key_sha256': _signer_field(
+                block, r'public key SHA-256 digest:\s*([0-9a-fA-F]+)'),
+            'public_key_sha1': _signer_field(
+                block, r'public key SHA-1 digest:\s*([0-9a-fA-F]+)'),
+            'public_key_md5': _signer_field(
+                block, r'public key MD5 digest:\s*([0-9a-fA-F]+)'),
+            'has_installed_data_capability': _signer_field(
+                block,
+                r'Has installed data capability:\s*(true|false)') == 'true',
+            'has_shared_uid_capability': _signer_field(
+                block,
+                r'Has shared UID capability\s*:\s*(true|false)') == 'true',
+            'has_permission_capability': _signer_field(
+                block,
+                r'Has permission capability\s*:\s*(true|false)') == 'true',
+            'has_rollback_capability': _signer_field(
+                block,
+                r'Has rollback capability\s*:\s*(true|false)') == 'true',
+            'has_auth_capability': _signer_field(
+                block,
+                r'Has auth capability\s*:\s*(true|false)') == 'true',
+        })
+    return signers
+
+
+def run_apksigner_lineage(checksum, app_path, tools_dir):
+    """Get APK Signing Certificate Lineage (v3 key rotation history)."""
+    has_lineage = False
+    lineage_signers = []
+    raw_output = ''
+    try:
+        apksigner = Path(tools_dir) / 'apksigner.jar'
+        args = [find_java_binary(), '-Xmx1024M',
+                '-Djava.library.path=', '-jar',
+                apksigner.as_posix(),
+                'lineage', '--print-certs', '--in', app_path]
+        logger.info('Getting Signing Certificate Lineage')
+        proc = subprocess.run(
+            args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False)
+        raw_output = proc.stdout.decode('utf-8', 'ignore')
+        if 'does not contain a valid lineage' not in raw_output:
+            has_lineage = True
+            lineage_signers = parse_lineage_signers(raw_output)
+    except Exception as exp:
+        msg = 'Failed to get signing certificate lineage with apksigner'
+        logger.error(msg)
+        append_scan_status(checksum, msg, repr(exp))
+    return has_lineage, lineage_signers, raw_output
 
 
 def get_signature_versions(checksum, app_path, tools_dir, signed):
     """Get signature versions using apksigner."""
     v1, v2, v3, v4 = False, False, False, False
+    is_rotated = False
+    rotation_min_sdk = None
+    signer_fingerprints = []
+    rotated_fingerprints = []
+    verify_output = ''
+    verify_signers = []
+    verify_warnings = []
     try:
         if not signed:
-            return v1, v2, v3, v4
+            return (v1, v2, v3, v4, is_rotated, rotation_min_sdk,
+                    signer_fingerprints, rotated_fingerprints,
+                    verify_output, verify_signers, verify_warnings)
         logger.info('Getting Signature Versions')
         apksigner = Path(tools_dir) / 'apksigner.jar'
         args = [find_java_binary(), '-Xmx1024M',
                 '-Djava.library.path=', '-jar',
                 apksigner.as_posix(),
-                'verify', '--verbose', app_path]
+                'verify', '--verbose', '--print-certs', app_path]
         out = subprocess.check_output(
             args, stderr=subprocess.STDOUT)
         out = out.decode('utf-8', 'ignore')
+        verify_output = out
         if re.findall(r'v1 scheme \(JAR signing\): true', out):
             v1 = True
         if re.findall(r'\(APK Signature Scheme v2\): true', out):
@@ -156,11 +298,27 @@ def get_signature_versions(checksum, app_path, tools_dir, signed):
             v3 = True
         if re.findall(r'\(APK Signature Scheme v4\): true', out):
             v4 = True
+        is_rotated = bool(re.findall(
+            r'rotated signer', out, re.IGNORECASE))
+        rotation_match = re.search(
+            r'Rotation min SDK version:\s*(\d+)', out)
+        if rotation_match:
+            rotation_min_sdk = rotation_match.group(1)
+        signer_fingerprints = re.findall(
+            r'^Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]+)',
+            out, re.MULTILINE)
+        rotated_fingerprints = re.findall(
+            r'Rotated Signing Certificate History certificate '
+            r'SHA-256 digest:\s*([0-9a-fA-F]+)', out)
+        verify_signers = parse_verify_signers(out)
+        verify_warnings = parse_verify_warnings(out)
     except Exception as exp:
         msg = 'Failed to get signature versions with apksigner'
         logger.error(msg)
         append_scan_status(checksum, msg, repr(exp))
-    return v1, v2, v3, v4
+    return (v1, v2, v3, v4, is_rotated, rotation_min_sdk,
+            signer_fingerprints, rotated_fingerprints,
+            verify_output, verify_signers, verify_warnings)
 
 
 def apksigtool_cert(checksum, apk_path, tools_dir):
@@ -168,6 +326,8 @@ def apksigtool_cert(checksum, apk_path, tools_dir):
     certlist = []
     certs = []
     pub_keys = []
+    certs_struct = []
+    pub_keys_struct = []
     signed = False
     certs_no = 0
     min_sdk = None
@@ -205,10 +365,17 @@ def apksigtool_cert(checksum, apk_path, tools_dir):
                             for i in d:
                                 if i not in certs:
                                     certs.append(i)
+                            cert_struct = get_cert_details_struct(cert.data)
+                            if cert_struct not in certs_struct:
+                                certs_struct.append(cert_struct)
                         p = get_pub_key_details(signer.public_key.data)
                         for j in p:
                             if j not in pub_keys:
                                 pub_keys.append(j)
+                        pub_key_struct = get_pub_key_details_struct(
+                            signer.public_key.data)
+                        if pub_key_struct not in pub_keys_struct:
+                            pub_keys_struct.append(pub_key_struct)
         except Exception:
             logger.warning('Failed to get signature versions with apksigtool')
 
@@ -216,7 +383,9 @@ def apksigtool_cert(checksum, apk_path, tools_dir):
             certlist.append('Binary is signed')
         else:
             certlist.append('Binary is not signed')
-        v1, v2, v3, v4 = get_signature_versions(
+        (v1, v2, v3, v4, is_rotated, rotation_min_sdk,
+         signer_fingerprints, rotated_fingerprints, verify_output,
+         verify_signers, verify_warnings) = get_signature_versions(
             checksum,
             apk_path,
             tools_dir,
@@ -229,6 +398,14 @@ def apksigtool_cert(checksum, apk_path, tools_dir):
         certlist.append(f'v2 signature: {v2}')
         certlist.append(f'v3 signature: {v3}')
         certlist.append(f'v4 signature: {v4}')
+        certlist.append(f'Rotated signing key: {is_rotated}')
+        if rotation_min_sdk:
+            certlist.append(
+                f'Rotation min SDK version: {rotation_min_sdk}')
+        for fp in signer_fingerprints:
+            certlist.append(f'Current Signer SHA-256: {fp}')
+        for fp in rotated_fingerprints:
+            certlist.append(f'Rotated (historical) Signer SHA-256: {fp}')
         certlist.extend(certs)
         certlist.extend(pub_keys)
         certlist.append(f'Found {certs_no} unique certificates')
@@ -245,6 +422,15 @@ def apksigtool_cert(checksum, apk_path, tools_dir):
         'v3': v3,
         'v4': v4,
         'min_sdk': min_sdk,
+        'is_rotated': is_rotated,
+        'rotation_min_sdk': rotation_min_sdk,
+        'signer_fingerprints': signer_fingerprints,
+        'rotated_fingerprints': rotated_fingerprints,
+        'certificates': certs_struct,
+        'public_keys': pub_keys_struct,
+        'apksigner_verify_output': verify_output,
+        'verify_signers': verify_signers,
+        'verify_warnings': verify_warnings,
     }
 
 
@@ -258,7 +444,9 @@ def get_cert_data(checksum, a, app_path, tools_dir):
     else:
         certlist.append('Binary is not signed')
         certlist.append('Missing certificate')
-    v1, v2, v3, v4 = get_signature_versions(
+    (v1, v2, v3, v4, is_rotated, rotation_min_sdk,
+     signer_fingerprints, rotated_fingerprints, verify_output,
+     verify_signers, verify_warnings) = get_signature_versions(
         checksum,
         app_path,
         tools_dir,
@@ -271,17 +459,28 @@ def get_cert_data(checksum, a, app_path, tools_dir):
     certlist.append(f'v2 signature: {v2}')
     certlist.append(f'v3 signature: {v3}')
     certlist.append(f'v4 signature: {v4}')
+    certlist.append(f'Rotated signing key: {is_rotated}')
+    if rotation_min_sdk:
+        certlist.append(f'Rotation min SDK version: {rotation_min_sdk}')
+    for fp in signer_fingerprints:
+        certlist.append(f'Current Signer SHA-256: {fp}')
+    for fp in rotated_fingerprints:
+        certlist.append(f'Rotated (historical) Signer SHA-256: {fp}')
 
     certs = set(a.get_certificates_der_v3() + a.get_certificates_der_v2()
                 + [a.get_certificate_der(x)
                     for x in a.get_signature_names()])
     pkeys = set(a.get_public_keys_der_v3() + a.get_public_keys_der_v2())
 
+    certs_struct = []
     for cert in certs:
         certlist.extend(get_cert_details(cert))
+        certs_struct.append(get_cert_details_struct(cert))
 
+    pub_keys_struct = []
     for public_key in pkeys:
         certlist.extend(get_pub_key_details(public_key))
+        pub_keys_struct.append(get_pub_key_details_struct(public_key))
 
     if len(certs) > 0:
         certlist.append(f'Found {len(certs)} unique certificates')
@@ -294,6 +493,15 @@ def get_cert_data(checksum, a, app_path, tools_dir):
         'v3': v3,
         'v4': v4,
         'min_sdk': None,
+        'is_rotated': is_rotated,
+        'rotation_min_sdk': rotation_min_sdk,
+        'signer_fingerprints': signer_fingerprints,
+        'rotated_fingerprints': rotated_fingerprints,
+        'certificates': certs_struct,
+        'public_keys': pub_keys_struct,
+        'apksigner_verify_output': verify_output,
+        'verify_signers': verify_signers,
+        'verify_warnings': verify_warnings,
     }
 
 
@@ -321,6 +529,14 @@ def cert_info(app_dic, man_dict):
                 app_dic['md5'],
                 app_dic['app_path'],
                 app_dic['tools_dir'])
+
+        has_lineage, lineage_signers, lineage_raw_output = False, [], ''
+        if cert_data['signed']:
+            has_lineage, lineage_signers, lineage_raw_output = (
+                run_apksigner_lineage(
+                    app_dic['md5'],
+                    app_dic['app_path'],
+                    app_dic['tools_dir']))
 
         cert_path = os.path.join(app_dic['app_dir'], 'META-INF/')
         if os.path.exists(cert_path):
@@ -407,10 +623,79 @@ def cert_info(app_dic, man_dict):
                 'collision issues.')
             title = 'Certificate algorithm vulnerable to hash collision'
             findings.append((status, desc, title))
+        if cert_data.get('is_rotated'):
+            summary[INFO] += 1
+            desc = (
+                'Application signing key has been rotated '
+                '(APK Signature Scheme v3).')
+            if cert_data.get('rotation_min_sdk'):
+                desc += (
+                    ' Rotation applies from API level '
+                    f'{cert_data["rotation_min_sdk"]} onwards.')
+            findings.append((INFO, desc, 'Signing Key Rotation Detected'))
+        signer_fingerprints = cert_data.get('signer_fingerprints') or []
+        rotated_fingerprints = cert_data.get('rotated_fingerprints') or []
+        if signer_fingerprints:
+            summary[INFO] += 1
+            desc = (
+                'Signing certificate SHA-256 fingerprint(s): '
+                f'{", ".join(signer_fingerprints)}. '
+                'Compare this value against another scan report of the '
+                'same app to verify whether the signing key changed '
+                'between builds.')
+            findings.append((
+                INFO, desc, 'Signing Certificate Fingerprint'))
+        if rotated_fingerprints:
+            summary[INFO] += 1
+            desc = (
+                'Previous (rotated) signing certificate SHA-256 '
+                f'fingerprint(s): {", ".join(rotated_fingerprints)}.')
+            findings.append((
+                INFO, desc, 'Rotated Signing Certificate Fingerprint'))
+        if has_lineage:
+            summary[INFO] += 1
+            findings.append((
+                INFO,
+                'Application signing certificate lineage contains '
+                f'{len(lineage_signers)} historical signer(s), confirming '
+                'a proper v3 key rotation chain.',
+                'Signing Certificate Lineage Present'))
         return {
             'certificate_info': cert_data['cert_data'],
             'certificate_findings': findings,
             'certificate_summary': summary,
+            'signer_certificate_sha256': signer_fingerprints,
+            'rotated_certificate_sha256': rotated_fingerprints,
+            'signing_certificates': cert_data.get('certificates') or [],
+            'public_keys': cert_data.get('public_keys') or [],
+            'signature_schemes': {
+                'v1': bool(cert_data.get('v1')),
+                'v2': bool(cert_data.get('v2')),
+                'v3': bool(cert_data.get('v3')),
+                'v4': bool(cert_data.get('v4')),
+                'is_rotated': bool(cert_data.get('is_rotated')),
+                'rotation_min_sdk': cert_data.get('rotation_min_sdk'),
+            },
+            'apksigner_verify_output': cert_data.get(
+                'apksigner_verify_output') or '',
+            'apksigner_verify': {
+                'verified': bool(cert_data.get('signed')),
+                'schemes': {
+                    'v1': bool(cert_data.get('v1')),
+                    'v2': bool(cert_data.get('v2')),
+                    'v3': bool(cert_data.get('v3')),
+                    'v4': bool(cert_data.get('v4')),
+                },
+                'signers': cert_data.get('verify_signers') or [],
+                'warnings': cert_data.get('verify_warnings') or [],
+                'raw_output': cert_data.get(
+                    'apksigner_verify_output') or '',
+            },
+            'apksigner_lineage': {
+                'has_lineage': has_lineage,
+                'signers': lineage_signers,
+                'raw_output': lineage_raw_output,
+            },
         }
     except Exception as exp:
         msg = 'Reading Code Signing Certificate'
